@@ -9,10 +9,9 @@
     }
   },
   "map": {
-    "usd_path": "/home/attia/NatoCMRE/bluerovwithmass3.usd"
+    "usd_path": "Assets/BlueROV_3D_Sonar.usd"
   },
   "robot": {
-    "usd_path": "/home/attia/NatoCMRE/bluerovwithmass3.usd",
     "prim_path": "/World/BROV_low",
     "translation": [
       0.0,
@@ -60,11 +59,10 @@
           0.05,
           0.05,
           0.2
-        ],
-        "yaml_path": null
+        ]
       },
-      "ros2_topic": "/sim/uw_camera/image_raw",
-      "ros2_camera_info_topic": "/sim/uw_camera/camera_info",
+      "ros2_topic": "/IsaacSim/uw_camera/image_raw",
+      "ros2_camera_info_topic": "/IsaacSim/uw_camera/camera_info",
       "ros2_frame_id": "uw_camera_link"
     },
     "dvl": {
@@ -82,7 +80,7 @@
         -0.2
       ],
       "frequency_hz": 10,
-      "ros2_topic": "/sim/dvl/odom",
+      "ros2_topic": "/IsaacSim/dvl/odom",
       "ros2_frame_id": "dvl_link",
       "elevation_deg": 22.5,
       "rotation_deg": 45.0,
@@ -107,13 +105,14 @@
         0.0
       ],
       "frequency_hz": 100,
-      "ros2_topic": "/sim/imu",
+      "ros2_topic": "/IsaacSim/imu",
       "ros2_frame_id": "imu_link"
     }
   },
-  "ros2": {
-    "enabled": true,
-    "namespace": "",
-    "queue_size": 10
+  "mvm": {
+    "config_path": "config/BlueROV.conf",
+    "model_name": "BlueROV",
+    "forces_topic": "/auv/forces_desired",
+    "forces_msg_type": "Float32MultiArray"
   }
 }
