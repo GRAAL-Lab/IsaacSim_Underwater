@@ -13,6 +13,7 @@
   },
   "robot": {
     "prim_path": "/World/BROV_low",
+    "pose_topic": "/auv/pose_actual",
     "translation": [
       0.0,
       0.0,
@@ -113,6 +114,6 @@
     "config_path": "config/BlueROV.conf",
     "model_name": "BlueROV",
     "forces_topic": "/auv/forces_desired",
-    "forces_msg_type": "Float32MultiArray"
+    "forces_msg_type": "Float64MultiArray"
   }
 }
