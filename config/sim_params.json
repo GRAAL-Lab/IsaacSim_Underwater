@@ -63,8 +63,47 @@
         ]
       },
       "ros2_topic": "/IsaacSim/uw_camera/image_raw",
+      "ros2_processed_topic": "/IsaacSim/uw_camera/processed/image_raw",
       "ros2_camera_info_topic": "/IsaacSim/uw_camera/camera_info",
       "ros2_frame_id": "uw_camera_link"
+    },
+    "imaging_sonar": {
+      "enabled": true,
+      "name": "ImagingSonarFront",
+      "prim_path": "/World/BROV_low/sonar",
+      "translation": [
+        0.2,
+        0.0,
+        0.2
+      ],
+      "orientation_rpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "frequency_hz": 40,
+      "min_range_m": 0.2,
+      "max_range_m": 40.0,
+      "range_resolution_m": 0.0025,
+      "horizontal_fov_deg": 130.0,
+      "vertical_fov_deg": 20.0,
+      "angular_resolution_deg": 0.6,
+      "horizontal_resolution": 4000,
+      "stream_width": 1920,
+      "stream_height": 1080,
+      "processing": {
+        "binning_method": "sum",
+        "normalizing_method": "range",
+        "attenuation": 0.1,
+        "gau_noise_param": 0.2,
+        "ray_noise_param": 0.05,
+        "intensity_offset": 0.0,
+        "intensity_gain": 1.0,
+        "central_peak": 2.0,
+        "central_std": 0.001
+      },
+      "ros2_topic": "/IsaacSim/imaging_sonar/image_raw",
+      "ros2_frame_id": "imaging_sonar_link"
     },
     "dvl": {
       "enabled": true,
