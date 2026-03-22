@@ -51,6 +51,47 @@ def _resolve_oceansim_root() -> Path:
     return Path("")
 
 
+def _build_oceansim_uw_params(uw_camera_cfg: dict) -> np.ndarray:
+    effects = uw_camera_cfg.get("uw_effects", {}) if isinstance(uw_camera_cfg, dict) else {}
+    backscatter_value = np.asarray(effects.get("backscatter_value", [0.0, 0.31, 0.24]), dtype=np.float32)
+    atten_coeff = np.asarray(effects.get("atten_coeff", [0.05, 0.05, 0.05]), dtype=np.float32)
+    backscatter_coeff = np.asarray(effects.get("backscatter_coeff", [0.05, 0.05, 0.2]), dtype=np.float32)
+    return np.concatenate((backscatter_value, backscatter_coeff, atten_coeff)).astype(np.float32, copy=False)
+
+
+def _default_processed_image_topic(raw_topic: str) -> str:
+    clean_topic = raw_topic.strip()
+    if clean_topic.endswith("/image_raw"):
+        return f"{clean_topic[:-len('/image_raw')]}/processed/image_raw"
+    return f"{clean_topic.rstrip('/')}/processed"
+
+
+def _require_if_enabled(cfg: dict, enabled_key: str, required_keys: list[str]) -> None:
+    try:
+        enabled = bool(_require(cfg, enabled_key))
+    except KeyError:
+        return
+    if not enabled:
+        return
+    for key in required_keys:
+        _require(cfg, key)
+
+
+def _apply_imaging_sonar_semantics(imaging_sonar_cfg: dict, get_prim_at_path, add_labels) -> None:
+    if not bool(imaging_sonar_cfg.get("enabled", False)):
+        return
+    prim = get_prim_at_path("/World")
+    if not prim.IsValid():
+        return
+    stage = prim.GetStage()
+    if stage is None:
+        return
+    prim_path_obj = prim.GetPath()
+    targets = [target for target in stage.Traverse() if target.IsValid() and target.GetPath().HasPrefix(prim_path_obj)]
+    for target in targets:
+        add_labels(prim=target, labels=["1.0"], instance_name="reflectivity", overwrite=True)
+
+
 def _add_mvm_paths_to_syspath() -> None:
     env_path = os.environ.get("MVM_PY_PATH")
     if not env_path:
@@ -153,6 +194,18 @@ def _validate_config(cfg: dict) -> None:
     ]
     for key in required_keys:
         _require(cfg, key)
+    _require_if_enabled(
+        cfg,
+        "sensors.imaging_sonar.enabled",
+        [
+            "sensors.imaging_sonar.prim_path",
+            "sensors.imaging_sonar.translation",
+            "sensors.imaging_sonar.orientation_rpy_deg",
+            "sensors.imaging_sonar.frequency_hz",
+            "sensors.imaging_sonar.ros2_topic",
+            "sensors.imaging_sonar.ros2_frame_id",
+        ],
+    )
 
 
 def main() -> None:
@@ -184,8 +237,8 @@ def main() -> None:
     from isaacsim.core.prims import RigidPrim, SingleXFormPrim
     from isaacsim.core.utils.extensions import enable_extension
     from isaacsim.core.utils.prims import get_prim_at_path
+    from isaacsim.core.utils.semantics import add_labels
     from isaacsim.core.utils.stage import is_stage_loading, open_stage
-    from isaacsim.sensors.camera import Camera
     from isaacsim.sensors.physics import IMUSensor
 
     import omni.graph.core as og
@@ -209,8 +262,68 @@ def main() -> None:
         sys.path.append(str(oceansim_root))
 
     from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
+    from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+    from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
+    from isaacsim.oceansim.utils.UWrenderer_utils import UW_render
+    import warp as wp
 
+    @wp.kernel
+    def _sonar_resize_rgba(
+        src: wp.array(ndim=3, dtype=wp.uint8),
+        dst: wp.array(ndim=3, dtype=wp.uint8),
+    ):
+        i, j = wp.tid()
+        src_h = src.shape[0]
+        src_w = src.shape[1]
+        dst_h = dst.shape[0]
+        dst_w = dst.shape[1]
+        src_i = wp.min(wp.int32(wp.float32(i) * wp.float32(src_h) / wp.float32(dst_h)), src_h - 1)
+        src_j = wp.min(wp.int32(wp.float32(j) * wp.float32(src_w) / wp.float32(dst_w)), src_w - 1)
+        for c in range(4):
+            dst[i, j, c] = src[src_i, src_j, c]
 
+    @wp.kernel
+    def _sonar_fan_rgba(
+        src: wp.array(ndim=3, dtype=wp.uint8),
+        dst: wp.array(ndim=3, dtype=wp.uint8),
+        half_fov_rad: float,
+        min_radius_norm: float,
+    ):
+        i, j = wp.tid()
+        dst_h = dst.shape[0]
+        dst_w = dst.shape[1]
+        src_h = src.shape[0]
+        src_w = src.shape[1]
+
+        x = wp.float32(j)
+        y = wp.float32(i)
+        cx = wp.float32(dst_w - 1) * 0.5
+        cy = wp.float32(dst_h - 1)
+        dx = x - cx
+        dy = cy - y
+
+        valid = False
+        if dy >= 0.0:
+            theta = wp.atan2(dx, wp.max(dy, wp.float32(1.0e-6)))
+            radius_norm = wp.sqrt(dx * dx + dy * dy) / wp.max(cy, wp.float32(1.0))
+            if (
+                wp.abs(theta) <= half_fov_rad
+                and radius_norm >= min_radius_norm
+                and radius_norm <= 1.0
+            ):
+                theta_norm = (theta + half_fov_rad) / wp.max(2.0 * half_fov_rad, wp.float32(1.0e-6))
+                radius_scaled = (radius_norm - min_radius_norm) / wp.max(1.0 - min_radius_norm, wp.float32(1.0e-6))
+                src_j = wp.min(wp.int32(theta_norm * wp.float32(src_w - 1) + 0.5), src_w - 1)
+                src_i = wp.min(wp.int32(radius_scaled * wp.float32(src_h - 1) + 0.5), src_h - 1)
+                for c in range(4):
+                    dst[i, j, c] = src[src_i, src_j, c]
+                valid = True
+
+        if not valid:
+            dst[i, j, 0] = wp.uint8(0)
+            dst[i, j, 1] = wp.uint8(0)
+            dst[i, j, 2] = wp.uint8(0)
+            dst[i, j, 3] = wp.uint8(255)
     simulation_app.update()
 
     # 1) Load world map USD.
@@ -218,6 +331,7 @@ def main() -> None:
         raise RuntimeError(f"Failed to open map stage: {map_usd}")
     while is_stage_loading():
         simulation_app.update()
+    _apply_imaging_sonar_semantics(sensors_cfg.get("imaging_sonar", {}), get_prim_at_path, add_labels)
 
     # 2) Ensure robot prim exists (embedded in map USD).
     robot_cfg = cfg["robot"]
@@ -293,12 +407,16 @@ def main() -> None:
         f"{thruster_graph_path}/ThrusterForcesSub.outputs:data"
     )
 
-    # 3) Attach camera sensor and publish raw image to ROS2.
+    # 3) Attach OceanSim camera and publish raw + underwater images.
     uw_camera_cfg = sensors_cfg["uw_camera"]
     if not bool(uw_camera_cfg["enabled"]):
         raise RuntimeError("sensors.uw_camera.enabled must be true")
 
-    uw_camera = Camera(
+    processed_topic = str(
+        uw_camera_cfg.get("ros2_processed_topic", _default_processed_image_topic(str(uw_camera_cfg["ros2_topic"])))
+    ).strip()
+
+    uw_camera = UW_Camera(
         prim_path=str(uw_camera_cfg["prim_path"]),
         name=str(uw_camera_cfg.get("name", "UWCamFront")),
         frequency=float(uw_camera_cfg["frequency_hz"]),
@@ -310,7 +428,11 @@ def main() -> None:
         ),
     )
 
-    uw_camera.initialize()
+    uw_camera.initialize(
+        UW_param=_build_oceansim_uw_params(uw_camera_cfg),
+        viewport=False,
+        enable_ros2_pub=False,
+    )
 
     camera_graph_path = "/ROS2UWCameraGraph"
     camera_frame_skip = max(0, int(round(render_fps / max(float(uw_camera_cfg["frequency_hz"]), 1e-6))) - 1)
@@ -343,6 +465,236 @@ def main() -> None:
             ],
         },
     )
+
+    processed_graph_path = "/ROS2ProcessedUWCameraGraph"
+    og.Controller.edit(
+        {"graph_path": processed_graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("ProcessedImagePub", "isaacsim.ros2.bridge.ROS2PublishImage"),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "ProcessedImagePub.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", "ProcessedImagePub.inputs:timeStamp"),
+                ("ROS2Context.outputs:context", "ProcessedImagePub.inputs:context"),
+            ],
+            keys.SET_VALUES: [
+                ("ProcessedImagePub.inputs:topicName", processed_topic),
+                ("ProcessedImagePub.inputs:frameId", str(uw_camera_cfg["ros2_frame_id"])),
+                ("ProcessedImagePub.inputs:encoding", "rgb8"),
+                ("ProcessedImagePub.inputs:queueSize", queue_size),
+                ("ProcessedImagePub.inputs:nodeNamespace", ros_namespace),
+                ("ProcessedImagePub.inputs:cudaDeviceIndex", -1),
+                ("ProcessedImagePub.inputs:width", int(uw_camera_cfg["resolution"][0])),
+                ("ProcessedImagePub.inputs:height", int(uw_camera_cfg["resolution"][1])),
+            ],
+        },
+    )
+    simulation_app.update()
+    processed_image_data_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:data")
+    processed_image_buffer_size_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:bufferSize")
+    processed_image_width_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:width")
+    processed_image_height_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:height")
+    processed_image_width = int(uw_camera_cfg["resolution"][0])
+    processed_image_height = int(uw_camera_cfg["resolution"][1])
+    processed_image_zero_frame = np.zeros((processed_image_height, processed_image_width, 3), dtype=np.uint8)
+    if processed_image_width_attr is not None:
+        processed_image_width_attr.set(processed_image_width)
+    if processed_image_height_attr is not None:
+        processed_image_height_attr.set(processed_image_height)
+    if processed_image_buffer_size_attr is not None:
+        processed_image_buffer_size_attr.set(int(processed_image_zero_frame.size))
+    if processed_image_data_attr is not None:
+        processed_image_data_attr.set(processed_image_zero_frame.reshape(-1))
+
+    def _render_underwater_frame_rgb() -> np.ndarray | None:
+        raw_rgba = uw_camera._rgba_annot.get_data()
+        depth = uw_camera._depth_annot.get_data()
+        if raw_rgba.size == 0 or depth.size == 0:
+            return None
+
+        uw_image = wp.zeros_like(raw_rgba)
+        wp.launch(
+            dim=np.flip(uw_camera.get_resolution()),
+            kernel=UW_render,
+            inputs=[
+                raw_rgba,
+                depth,
+                uw_camera._backscatter_value,
+                uw_camera._atten_coeff,
+                uw_camera._backscatter_coeff,
+            ],
+            outputs=[uw_image],
+        )
+
+        if uw_camera._viewport:
+            uw_camera._provider.set_bytes_data_from_gpu(uw_image.ptr, uw_camera.get_resolution())
+        uw_rgba = uw_image.numpy()
+        return np.ascontiguousarray(uw_rgba[:, :, :3])
+
+    def _publish_processed_frame(frame_rgb: np.ndarray) -> None:
+        if processed_image_data_attr is None or processed_image_buffer_size_attr is None:
+            return
+        if processed_image_width_attr is not None:
+            processed_image_width_attr.set(int(frame_rgb.shape[1]))
+        if processed_image_height_attr is not None:
+            processed_image_height_attr.set(int(frame_rgb.shape[0]))
+        processed_image_buffer_size_attr.set(int(frame_rgb.size))
+        processed_image_data_attr.set(frame_rgb.reshape(-1))
+
+    imaging_sonar = None
+    imaging_sonar_data_attr = None
+    imaging_sonar_buffer_size_attr = None
+    imaging_sonar_width_attr = None
+    imaging_sonar_height_attr = None
+    imaging_sonar_cfg = sensors_cfg.get("imaging_sonar", {})
+    if bool(imaging_sonar_cfg.get("enabled", False)):
+        imaging_sonar = ImagingSonarSensor(
+            prim_path=str(imaging_sonar_cfg["prim_path"]),
+            name=str(imaging_sonar_cfg.get("name", "ImagingSonar")),
+            frequency=float(imaging_sonar_cfg["frequency_hz"]),
+            translation=vec3(imaging_sonar_cfg["translation"], "sensors.imaging_sonar.translation"),
+            orientation=quat_wxyz_from_rpy_deg(
+                imaging_sonar_cfg["orientation_rpy_deg"],
+                "sensors.imaging_sonar.orientation_rpy_deg",
+            ),
+            min_range=float(imaging_sonar_cfg.get("min_range_m", 0.2)),
+            max_range=float(imaging_sonar_cfg.get("max_range_m", 10.0)),
+            range_res=float(imaging_sonar_cfg.get("range_resolution_m", 0.05)),
+            hori_fov=float(imaging_sonar_cfg.get("horizontal_fov_deg", 130.0)),
+            vert_fov=float(imaging_sonar_cfg.get("vertical_fov_deg", 20.0)),
+            angular_res=float(imaging_sonar_cfg.get("angular_resolution_deg", 1.0)),
+            hori_res=int(imaging_sonar_cfg.get("horizontal_resolution", 1024)),
+        )
+        imaging_sonar.sonar_initialize(
+            output_dir=None,
+            viewport=False,
+            include_unlabelled=True,
+            if_array_copy=True,
+        )
+        imaging_sonar_device = wp.get_preferred_device()
+        imaging_sonar_device_str = str(imaging_sonar_device)
+        if not imaging_sonar_device_str.startswith("cuda:"):
+            raise RuntimeError("Imaging sonar GPU-only streaming requires a CUDA Warp device")
+        imaging_sonar_cuda_device_index = int(imaging_sonar_device_str.split(":", 1)[1])
+        imaging_sonar_stream_width = int(imaging_sonar_cfg.get("stream_width", imaging_sonar.sonar_map.shape[1]))
+        imaging_sonar_stream_height = int(imaging_sonar_cfg.get("stream_height", imaging_sonar.sonar_map.shape[0]))
+        imaging_sonar_stream_buffer_count = max(2, int(imaging_sonar_cfg.get("stream_buffer_count", 3)))
+        imaging_sonar_stream_rgba_buffers = [
+            wp.zeros(
+                shape=(imaging_sonar_stream_height, imaging_sonar_stream_width, 4),
+                dtype=wp.uint8,
+                device=imaging_sonar_device,
+            )
+            for _ in range(imaging_sonar_stream_buffer_count)
+        ]
+        imaging_sonar_render_buffer_index = 0
+        imaging_sonar_publish_buffer_index = 0
+
+        imaging_sonar_graph_path = "/ROS2ImagingSonarGraph"
+        og.Controller.edit(
+            {"graph_path": imaging_sonar_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: [
+                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                    ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                    ("PublishSonarImage", "isaacsim.ros2.bridge.ROS2PublishImage"),
+                ],
+                keys.CONNECT: [
+                    ("OnPlaybackTick.outputs:tick", "PublishSonarImage.inputs:execIn"),
+                    ("ReadSimTime.outputs:simulationTime", "PublishSonarImage.inputs:timeStamp"),
+                    ("ROS2Context.outputs:context", "PublishSonarImage.inputs:context"),
+                ],
+                keys.SET_VALUES: [
+                    ("PublishSonarImage.inputs:topicName", str(imaging_sonar_cfg["ros2_topic"])),
+                    ("PublishSonarImage.inputs:frameId", str(imaging_sonar_cfg["ros2_frame_id"])),
+                    ("PublishSonarImage.inputs:queueSize", queue_size),
+                    ("PublishSonarImage.inputs:nodeNamespace", ros_namespace),
+                    ("PublishSonarImage.inputs:encoding", "rgba8"),
+                    ("PublishSonarImage.inputs:cudaDeviceIndex", imaging_sonar_cuda_device_index),
+                    ("PublishSonarImage.inputs:width", imaging_sonar_stream_width),
+                    ("PublishSonarImage.inputs:height", imaging_sonar_stream_height),
+                ],
+            },
+        )
+        simulation_app.update()
+        imaging_sonar_data_attr = og.Controller.attribute(f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:data")
+        imaging_sonar_data_ptr_attr = og.Controller.attribute(
+            f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:dataPtr"
+        )
+        imaging_sonar_buffer_size_attr = og.Controller.attribute(
+            f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:bufferSize"
+        )
+        imaging_sonar_width_attr = og.Controller.attribute(f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:width")
+        imaging_sonar_height_attr = og.Controller.attribute(
+            f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:height"
+        )
+        if imaging_sonar_width_attr is not None:
+            imaging_sonar_width_attr.set(imaging_sonar_stream_width)
+        if imaging_sonar_height_attr is not None:
+            imaging_sonar_height_attr.set(imaging_sonar_stream_height)
+        if imaging_sonar_buffer_size_attr is not None:
+            imaging_sonar_buffer_size_attr.set(imaging_sonar_stream_width * imaging_sonar_stream_height * 4)
+        if imaging_sonar_data_ptr_attr is not None:
+            imaging_sonar_data_ptr_attr.set(int(imaging_sonar_stream_rgba_buffers[0].ptr))
+        if imaging_sonar_data_attr is not None:
+            imaging_sonar_data_attr.set([])
+
+    def _render_imaging_sonar_frame() -> bool:
+        nonlocal imaging_sonar_render_buffer_index, imaging_sonar_publish_buffer_index
+        if imaging_sonar is None:
+            return False
+        processing_cfg = imaging_sonar_cfg.get("processing", {})
+        imaging_sonar.make_sonar_data(
+            binning_method=str(processing_cfg.get("binning_method", "sum")),
+            normalizing_method=str(processing_cfg.get("normalizing_method", "range")),
+            attenuation=float(processing_cfg.get("attenuation", 0.1)),
+            gau_noise_param=float(processing_cfg.get("gau_noise_param", 0.2)),
+            ray_noise_param=float(processing_cfg.get("ray_noise_param", 0.05)),
+            intensity_offset=float(processing_cfg.get("intensity_offset", 0.0)),
+            intensity_gain=float(processing_cfg.get("intensity_gain", 1.0)),
+            central_peak=float(processing_cfg.get("central_peak", 2.0)),
+            central_std=float(processing_cfg.get("central_std", 0.001)),
+        )
+        sonar_rgba = imaging_sonar.make_sonar_image()
+        render_buffer = imaging_sonar_stream_rgba_buffers[imaging_sonar_render_buffer_index]
+        half_fov_rad = 0.5 * np.deg2rad(float(imaging_sonar_cfg.get("horizontal_fov_deg", 130.0)))
+        min_range_m = float(imaging_sonar_cfg.get("min_range_m", 0.2))
+        max_range_m = float(imaging_sonar_cfg.get("max_range_m", 3.0))
+        min_radius_norm = 0.0
+        if max_range_m > min_range_m and min_range_m > 0.0:
+            min_radius_norm = float(np.clip(min_range_m / max_range_m, 0.0, 0.99))
+        wp.launch(
+            dim=(imaging_sonar_stream_height, imaging_sonar_stream_width),
+            kernel=_sonar_fan_rgba,
+            inputs=[
+                sonar_rgba,
+                render_buffer,
+                half_fov_rad,
+                min_radius_norm,
+            ],
+        )
+        imaging_sonar_publish_buffer_index = imaging_sonar_render_buffer_index
+        imaging_sonar_render_buffer_index = (
+            imaging_sonar_render_buffer_index + 1
+        ) % imaging_sonar_stream_buffer_count
+        return True
+
+    def _publish_imaging_sonar_frame() -> None:
+        if imaging_sonar_data_ptr_attr is None or imaging_sonar_buffer_size_attr is None:
+            return
+        if imaging_sonar_width_attr is not None:
+            imaging_sonar_width_attr.set(imaging_sonar_stream_width)
+        if imaging_sonar_height_attr is not None:
+            imaging_sonar_height_attr.set(imaging_sonar_stream_height)
+        imaging_sonar_buffer_size_attr.set(imaging_sonar_stream_width * imaging_sonar_stream_height * 4)
+        imaging_sonar_data_ptr_attr.set(
+            int(imaging_sonar_stream_rgba_buffers[imaging_sonar_publish_buffer_index].ptr)
+        )
 
     # 4) Publish robot pose to ROS2.
     pose_graph_path = "/ROS2PoseGraph"
@@ -627,6 +979,8 @@ def main() -> None:
         forces = _select_forces()
         tau_total = _compute_tau(v_body, pose_vec, forces)
         _apply_wrench(R, tau_total)
+        if _render_imaging_sonar_frame():
+            _publish_imaging_sonar_frame()
 
     simulation_app.update()
     world.reset()
@@ -640,14 +994,21 @@ def main() -> None:
     world.add_physics_callback("mvm_dynamics", _on_physics_step)
 
     try:
+        main_loop_frame = 0
         while simulation_app.is_running():
             world.step(render=True)
+            processed_frame = _render_underwater_frame_rgb()
+            if processed_frame is not None:
+                _publish_processed_frame(processed_frame)
 
             velocity = dvl_sensor.get_linear_vel_fd(physics_dt=1.0 / physics_hz)
             if isinstance(velocity, np.ndarray) and velocity.shape[0] >= 3:
                 dvl_linear_vel_attr.set([float(velocity[0]), float(velocity[1]), float(velocity[2])])
+            main_loop_frame += 1
     finally:
         world.remove_physics_callback("mvm_dynamics")
+        if imaging_sonar is not None:
+            imaging_sonar.close()
         uw_camera.close()
         world.stop()
         simulation_app.close()
