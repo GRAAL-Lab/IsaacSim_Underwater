@@ -2,9 +2,10 @@
 
 **GPU-accelerated underwater robotics simulation in NVIDIA Isaac Sim 5.1**, with:
 - A BlueROV-based scene (USD) and underwater environment assets
-- Hydrodynamic vehicle dynamics via **Marine Vehicle Models (MVM)** (Fossen-style 6-DOF model)
+- Hydrodynamic vehicle dynamics via **Marine Vehicle Models (MVM)** (Fossen's 6-DOF model)
 - **OceanSim**-based DVL sensor
 - **OceanSim** 2D imaging sonar published as a ROS2 image topic
+- **3D Sonar** (simulated using RTX Lidar) published as ROS2 point clouds
 - Isaac Sim physics IMU
 - RGB camera with in-sim OceanSim underwater rendering
 - ROS2 I/O for closed-loop 
@@ -150,6 +151,7 @@ After extracting, you should see files like:
 - `Assets/BlueROV_3D_Sonar.usd`
 - `Assets/BROV_low.usd`
 - `Assets/ThreeDSonar_HighFrequency.json`
+- `Assets/ThreeDSonar_LowFrequency.json`
 
 ---
 
@@ -176,8 +178,6 @@ export ISAACSIM_ROOT=${ISAACSIM_ROOT:-/path/to/isaac-sim-5.1}
   --config "$ISAAC_UW_ROOT/config/sim_params.json"
 ```
 
-To run headless, edit `config/sim_params.json`:
-- `simulation.app.headless: true`
 
 ---
 
@@ -231,6 +231,11 @@ Thruster ordering and geometry are defined in `config/BlueROV.conf` (thruster po
 ### Sensors + ROS2
 The script sets up ROS2 graphs for:
 - **Pose** (PoseStamped): `robot.pose_topic` (default: `/auv/pose_actual`)
+- **Velocity** (Twist, body-frame): `robot.velocity_topic` (default: `/auv/velocity_actual`)
+- **Acceleration** (Twist, body-frame): `robot.acceleration_topic` (default: `/auv/acceleration_actual`)
+- **TF** (OmniGraph / Isaac Sim ROS2 bridge):
+  - dynamic `World -> BROV_low`
+  - static `BROV_low ->` each enabled sensor frame (`uw_camera_link`, `imaging_sonar_link`, `rtx_lidar_link`, `imu_link`, `dvl_link`)
 - **Underwater RGB camera** (Image + CameraInfo):
   - `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
   - `sensors.uw_camera.ros2_camera_info_topic` (default: `/IsaacSim/uw_camera/camera_info`)
@@ -239,6 +244,9 @@ The script sets up ROS2 graphs for:
 - **OceanSim 2D imaging sonar** (raw `sensor_msgs/Image`):
   - `sensors.imaging_sonar.ros2_topic` (default: `/IsaacSim/imaging_sonar/image_raw`)
   - `sensors.imaging_sonar.ros2_frame_id` (default: `imaging_sonar_link`)
+- **3D sonar* (`sensor_msgs/PointCloud2`):
+  - `sensors.rtx_lidar.ros2_topic` (default: `/IsaacSim/rtx_lidar/point_cloud`)
+  - `sensors.rtx_lidar.ros2_frame_id` (default: `rtx_lidar_link`)
 - **IMU** (sensor_msgs/Imu): `sensors.imu.ros2_topic` (default: `/IsaacSim/imu`)
 - **DVL** (nav_msgs/Odometry): `sensors.dvl.ros2_topic` (default: `/IsaacSim/dvl/odom`)
   - The DVL comes from **OceanSim**.
@@ -251,6 +259,32 @@ The 2D imaging sonar:
 - can publish a fan-view sonar display as raw `sensor_msgs/Image`
 - uses `reflectivity` semantics from the loaded USD scene to compute returns
 - keeps the display path on GPU and publishes through the Isaac Sim ROS2 bridge without a standalone ROS node
+
+
+### 3D Sonar Simulation via RTX Lidar
+The 3D sonar in this simulation is implemented using Isaac Sim's RTX Lidar sensor. This approach leverages GPU-accelerated ray tracing to emulate a solid-state 3D sonar, producing point clouds similar to those from real underwater sonars. This is a geometry-driven approximation, inspired by real 3D sonar firing patterns, but does not yet model full underwater acoustic propagation or multipath effects.
+
+You can create an RTX Lidar (used as a 3D sonar) under the vehicle from a custom JSON lidar profile and publish its point cloud through Isaac Sim's native ROS2 bridge.
+
+Configure it in `config/sim_params.json` under `sensors.rtx_lidar`:
+- `enabled`
+- `name`
+- `config_path`
+- `prim_path`
+- `translation`
+- `orientation_rpy_deg`
+- `ros2_topic`
+- `ros2_frame_id`
+- `frame_skip_count`
+- `show_debug_view`
+
+Behavior:
+- the script creates a generic `OmniLidar` under `sensors.rtx_lidar.prim_path`, which should be a child of the robot prim
+- the lidar JSON profile is applied directly onto the created sensor's `omni:sensor:Core:*` attributes at runtime
+- ROS2 publication is created from Python with `ROS2RtxLidarHelper`
+- full-scan point cloud publishing is always enabled
+- no OmniGraph needs to be pre-authored in a lidar asset
+
 
 Relevant config keys:
 - `sensors.imaging_sonar.prim_path`, `translation`, `orientation_rpy_deg`
@@ -266,8 +300,12 @@ Relevant config keys:
 ### 3D sonar assets
 The `Assets/` folder contains a solid-state “3D sonar” pattern described using an RTX-LiDAR-style profile (see `Assets/ThreeDSonar_HighFrequency.json`).
 
+**Note:** The 3D sonar is simulated using the RTX Lidar sensor in Isaac Sim, with a custom profile to mimic underwater sonar characteristics. This enables realistic point cloud generation for underwater robotics applications, but is currently limited to geometry-based returns (first intersection) and does not include full acoustic propagation, multipath, or phase-aware effects.
+
+
+
 This repo’s current public implementation focuses on:
-- embedding the 3D sonar model as an RTX sensor definition inside the USD assets
+- embedding the 3D sonar model as an RTX Lidar sensor definition inside the USD assets
 - providing a complete ROS2 + dynamics + sensor simulation scaffold suitable for SLAM / HIL experiments
 
 ---

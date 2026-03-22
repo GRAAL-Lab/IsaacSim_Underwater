@@ -1,7 +1,9 @@
 {
   "simulation": {
     "app": {
-      "headless": false
+      "headless": false,
+      "disable_viewport_updates": false,
+      "enable_motion_bvh": true
     },
     "timing": {
       "physics_hz": 120.0,
@@ -9,11 +11,13 @@
     }
   },
   "map": {
-    "usd_path": "Assets/BlueROV_3D_Sonar.usd"
+    "usd_path": "Assets/BlueROV_World.usd"
   },
   "robot": {
     "prim_path": "/World/BROV_low",
     "pose_topic": "/auv/pose_actual",
+    "velocity_topic": "/auv/velocity_actual",
+    "acceleration_topic": "/auv/acceleration_actual",
     "translation": [
       0.0,
       0.0,
@@ -63,7 +67,7 @@
         ]
       },
       "ros2_topic": "/IsaacSim/uw_camera/image_raw",
-      "ros2_processed_topic": "/IsaacSim/uw_camera/processed/image_raw",
+      "ros2_processed_topic": "/IsaacSim/uw_camera/processed",
       "ros2_camera_info_topic": "/IsaacSim/uw_camera/camera_info",
       "ros2_frame_id": "uw_camera_link"
     },
@@ -102,8 +106,28 @@
         "central_peak": 2.0,
         "central_std": 0.001
       },
-      "ros2_topic": "/IsaacSim/imaging_sonar/image_raw",
+      "ros2_topic": "/IsaacSim/imaging_sonar",
       "ros2_frame_id": "imaging_sonar_link"
+    },
+    "rtx_lidar": {
+      "enabled": true,
+      "name": "ThreeDSonarLowFrequency",
+      "config_path": "/home/attia/IsaacSim_Underwater/Assets/ThreeDSonar_LowFrequency.json",
+      "prim_path": "/World/BROV_low/ThreeDSonar",
+      "translation": [
+        0.2,
+        0.0,
+        0.2
+      ],
+      "orientation_rpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "ros2_topic": "/IsaacSim/rtx_lidar/point_cloud",
+      "ros2_frame_id": "three_d_sonar_link",
+      "frame_skip_count": 0,
+      "show_debug_view": true
     },
     "dvl": {
       "enabled": true,

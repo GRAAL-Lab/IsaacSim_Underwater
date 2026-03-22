@@ -133,6 +133,93 @@ def _set_local_pose(single_xform_prim, translation: list[float], orientation_wxy
     single_xform_prim.set_local_pose(translation=translation, orientation=orientation_wxyz)
 
 
+def _load_custom_rtx_lidar_profile(config_path: str) -> dict:
+    src_path = Path(config_path).expanduser().resolve()
+    if not src_path.is_file():
+        raise FileNotFoundError(f"RTX lidar config JSON does not exist: {src_path}")
+    if src_path.suffix.lower() != ".json":
+        raise ValueError(f"RTX lidar config must be a JSON file: {src_path}")
+
+    with src_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+
+    profile = config.get("profile")
+    if not isinstance(profile, dict):
+        raise ValueError(f"RTX lidar config is missing a valid 'profile' object: {src_path}")
+    if "numberOfEmitters" not in profile:
+        raise KeyError(f"numberOfEmitters not found in profile: {src_path}")
+    return config
+
+
+def _rtx_lidar_usd_value(value):
+    if isinstance(value, str):
+        if value == "solidState":
+            value = "solid_state"
+        return value.upper()
+    return value
+
+
+def _build_rtx_lidar_prim_creation_kwargs(profile: dict) -> dict:
+    emitter_states = profile.get("emitterStates", [])
+    emitter_state_count = min(int(profile.get("emitterStateCount", 0)), len(emitter_states))
+    prim_creation_kwargs = {}
+    for i in range(emitter_state_count):
+        if i < 2:
+            continue
+        state = emitter_states[i]
+        if not isinstance(state, dict) or not state:
+            continue
+        emitter_state_key = next(iter(state))
+        prim_creation_kwargs[f"omni:sensor:Core:emitterState:s{i+1:03}:{emitter_state_key}"] = type(
+            state[emitter_state_key]
+        )()
+    return prim_creation_kwargs
+
+
+def _set_rtx_lidar_attribute_if_present(prim, attribute: str, value) -> bool:
+    if prim.HasAttribute(attribute):
+        try:
+            prim.GetAttribute(attribute).Set(value)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _apply_custom_rtx_lidar_profile(prim, config: dict) -> None:
+    from itertools import cycle, islice
+
+    profile = config["profile"]
+    emitter_states = profile.get("emitterStates", [])
+    emitter_state_count = min(int(profile.get("emitterStateCount", 0)), len(emitter_states))
+
+    required_emitter_state_fields = {"azimuthDeg", "channelId", "elevationDeg", "fireTimeNs"}
+    num_emitters = int(profile["numberOfEmitters"])
+
+    for i in range(emitter_state_count):
+        state = emitter_states[i]
+        missing_fields = required_emitter_state_fields - set(state.keys())
+        for field in missing_fields:
+            if field == "channelId":
+                if "numberOfChannels" in profile:
+                    state[field] = list(islice(cycle(range(1, int(profile["numberOfChannels"]) + 1)), num_emitters))
+                else:
+                    state[field] = list(range(1, num_emitters + 1))
+                    profile["numberOfChannels"] = num_emitters
+            else:
+                state[field] = [0] * num_emitters
+
+        for field, raw_value in state.items():
+            attribute = f"omni:sensor:Core:emitterState:s{i+1:03}:{field}"
+            _set_rtx_lidar_attribute_if_present(prim, attribute, _rtx_lidar_usd_value(raw_value))
+
+    for field, raw_value in profile.items():
+        if field == "emitterStates":
+            continue
+        attribute = f"omni:sensor:Core:{field}"
+        _set_rtx_lidar_attribute_if_present(prim, attribute, _rtx_lidar_usd_value(raw_value))
+
+
 def _load_mvm(params: dict, base_dir: Path | None = None):
     mvm_cfg = params.get("mvm", {}) if isinstance(params, dict) else {}
     config_path = str(mvm_cfg.get("config_path", "")).strip()
@@ -162,6 +249,8 @@ def _validate_config(cfg: dict) -> None:
         "map.usd_path",
         "robot.prim_path",
         "robot.pose_topic",
+        "robot.velocity_topic",
+        "robot.acceleration_topic",
         "robot.translation",
         "robot.orientation_rpy_deg",
         "sensors.uw_camera.enabled",
@@ -185,11 +274,11 @@ def _validate_config(cfg: dict) -> None:
         "sensors.imu.translation",
         "sensors.imu.orientation_rpy_deg",
         "sensors.imu.frequency_hz",
-        "sensors.imu.ros2_topic",
-        "sensors.imu.ros2_frame_id",
-        "mvm.config_path",
-        "mvm.model_name",
-        "mvm.forces_topic",
+            "sensors.imu.ros2_topic",
+            "sensors.imu.ros2_frame_id",
+            "mvm.config_path",
+            "mvm.model_name",
+            "mvm.forces_topic",
         "mvm.forces_msg_type",
     ]
     for key in required_keys:
@@ -204,6 +293,21 @@ def _validate_config(cfg: dict) -> None:
             "sensors.imaging_sonar.frequency_hz",
             "sensors.imaging_sonar.ros2_topic",
             "sensors.imaging_sonar.ros2_frame_id",
+        ],
+    )
+    _require_if_enabled(
+        cfg,
+        "sensors.rtx_lidar.enabled",
+        [
+            "sensors.rtx_lidar.name",
+            "sensors.rtx_lidar.config_path",
+            "sensors.rtx_lidar.prim_path",
+            "sensors.rtx_lidar.translation",
+            "sensors.rtx_lidar.orientation_rpy_deg",
+            "sensors.rtx_lidar.ros2_topic",
+            "sensors.rtx_lidar.ros2_frame_id",
+            "sensors.rtx_lidar.frame_skip_count",
+            "sensors.rtx_lidar.show_debug_view",
         ],
     )
 
@@ -229,6 +333,8 @@ def main() -> None:
     simulation_app = SimulationApp(
         {
             "headless": bool(sim_cfg["app"]["headless"]),
+            "disable_viewport_updates": bool(sim_cfg["app"].get("disable_viewport_updates", False)),
+            "enable_motion_bvh": bool(sim_cfg["app"].get("enable_motion_bvh", True)),
             "max_gpu_count": 1,
         }
     )
@@ -242,7 +348,10 @@ def main() -> None:
     from isaacsim.sensors.physics import IMUSensor
 
     import omni.graph.core as og
+    import omni.kit.commands
+    import omni.replicator.core as rep
     import usdrt.Sdf
+    from pxr import Gf, Sdf
 
     keys = og.Controller.Keys
 
@@ -350,6 +459,95 @@ def main() -> None:
         orientation_wxyz=quat_wxyz_from_rpy_deg(robot_cfg["orientation_rpy_deg"], "robot.orientation_rpy_deg"),
     )
 
+    ros_namespace = ROS_NAMESPACE
+    queue_size = ROS_QUEUE_SIZE
+
+    rtx_lidar_cfg = sensors_cfg.get("rtx_lidar", {})
+    rtx_lidar_enabled = bool(rtx_lidar_cfg.get("enabled", False))
+    rtx_lidar_frame_id = None
+    if rtx_lidar_enabled:
+        rtx_lidar_config_path = _resolve_path(str(rtx_lidar_cfg["config_path"]), config_root)
+        rtx_lidar_profile = _load_custom_rtx_lidar_profile(rtx_lidar_config_path)
+        rtx_lidar_prim_creation_kwargs = _build_rtx_lidar_prim_creation_kwargs(rtx_lidar_profile["profile"])
+
+        rtx_lidar_mount_path = str(rtx_lidar_cfg["prim_path"]).strip()
+        if not rtx_lidar_mount_path:
+            raise ValueError("sensors.rtx_lidar.prim_path must not be empty")
+        if not rtx_lidar_mount_path.startswith(f"{robot_prim_path}/"):
+            raise ValueError(
+                "sensors.rtx_lidar.prim_path must mount the lidar under the robot prim. "
+                f"Expected prefix: {robot_prim_path}/"
+            )
+        rtx_lidar_child_name = rtx_lidar_mount_path.rsplit("/", 1)[-1]
+        translation = vec3(rtx_lidar_cfg["translation"], "sensors.rtx_lidar.translation")
+        orientation_wxyz = quat_wxyz_from_rpy_deg(
+            rtx_lidar_cfg["orientation_rpy_deg"],
+            "sensors.rtx_lidar.orientation_rpy_deg",
+        )
+        created_lidar_prim = rep.functional.create.omni_lidar(
+            position=(float(translation[0]), float(translation[1]), float(translation[2])),
+            rotation=tuple(float(v) for v in rtx_lidar_cfg["orientation_rpy_deg"]),
+            name=rtx_lidar_child_name,
+            parent=robot_prim_path,
+            **rtx_lidar_prim_creation_kwargs,
+        )
+        simulation_app.update()
+        if created_lidar_prim is None or not created_lidar_prim.IsValid():
+            raise RuntimeError(f"Failed to create RTX lidar at {rtx_lidar_mount_path}")
+
+        created_lidar_path = str(created_lidar_prim.GetPath())
+        rtx_lidar_prim = get_prim_at_path(created_lidar_path)
+        if not rtx_lidar_prim.IsValid():
+            raise RuntimeError(
+                "Created RTX lidar prim is invalid after creation. "
+                f"Expected mount path: {rtx_lidar_mount_path}, returned path: {created_lidar_path}"
+            )
+
+        if rtx_lidar_prim.HasAttribute("sensorModelPluginName"):
+            rtx_lidar_prim.GetAttribute("sensorModelPluginName").Set("omni.sensors.nv.lidar.lidar_core.plugin")
+        else:
+            rtx_lidar_prim.CreateAttribute("sensorModelPluginName", Sdf.ValueTypeNames.String, False).Set(
+                "omni.sensors.nv.lidar.lidar_core.plugin"
+            )
+        _apply_custom_rtx_lidar_profile(rtx_lidar_prim, rtx_lidar_profile)
+
+        rtx_lidar_render_product = rep.create.render_product(
+            created_lidar_path,
+            resolution=(128, 128),
+            render_vars=["GenericModelOutput", "RtxSensorMetadata"],
+        )
+        rtx_lidar_render_product_path = rtx_lidar_render_product.path
+
+        rtx_lidar_graph_path = "/ROS2RtxLidarGraph"
+        og.Controller.edit(
+            {"graph_path": rtx_lidar_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: [
+                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                    ("PublishRtxLidar", "isaacsim.ros2.bridge.ROS2RtxLidarHelper"),
+                ],
+                keys.CONNECT: [
+                    ("OnPlaybackTick.outputs:tick", "PublishRtxLidar.inputs:execIn"),
+                    ("ROS2Context.outputs:context", "PublishRtxLidar.inputs:context"),
+                ],
+                keys.SET_VALUES: [
+                    ("PublishRtxLidar.inputs:renderProductPath", rtx_lidar_render_product_path),
+                    ("PublishRtxLidar.inputs:topicName", str(rtx_lidar_cfg["ros2_topic"])),
+                    ("PublishRtxLidar.inputs:frameId", str(rtx_lidar_cfg["ros2_frame_id"])),
+                    ("PublishRtxLidar.inputs:type", "point_cloud"),
+                    ("PublishRtxLidar.inputs:fullScan", True),
+                    ("PublishRtxLidar.inputs:frameSkipCount", int(rtx_lidar_cfg["frame_skip_count"])),
+                    ("PublishRtxLidar.inputs:showDebugView", bool(rtx_lidar_cfg["show_debug_view"])),
+                    ("PublishRtxLidar.inputs:nodeNamespace", ros_namespace),
+                    ("PublishRtxLidar.inputs:queueSize", queue_size),
+                    ("PublishRtxLidar.inputs:resetSimulationTimeOnStop", True),
+                ],
+            },
+        )
+        simulation_app.update()
+        rtx_lidar_frame_id = str(rtx_lidar_cfg["ros2_frame_id"])
+
     # Simulation timing.
     physics_hz = float(sim_cfg["timing"]["physics_hz"])
     render_fps = float(sim_cfg["timing"]["render_fps"])
@@ -363,9 +561,6 @@ def main() -> None:
     )
 
     rov_rigid = world.scene.add(RigidPrim(prim_paths_expr=robot_prim_path, name="rov_body"))
-
-    ros_namespace = ROS_NAMESPACE
-    queue_size = ROS_QUEUE_SIZE
 
     mvm = _load_mvm(cfg, config_root)
     num_thrusters = int(mvm.num_thrusters)
@@ -697,9 +892,13 @@ def main() -> None:
         )
 
     # 4) Publish robot pose to ROS2.
+    imu_cfg = sensors_cfg["imu"]
+    dvl_cfg = sensors_cfg["dvl"]
     pose_graph_path = "/ROS2PoseGraph"
     pose_frame_id = robot_prim_path.rsplit("/", 1)[-1] or "base_link"
     pose_topic = str(robot_cfg["pose_topic"]).strip()
+    velocity_topic = str(robot_cfg["velocity_topic"]).strip()
+    acceleration_topic = str(robot_cfg["acceleration_topic"]).strip()
     og.Controller.edit(
         {"graph_path": pose_graph_path, "evaluator_name": "execution"},
         {
@@ -750,8 +949,190 @@ def main() -> None:
     pose_attr_ori_z = _find_attr("inputs:pose:orientation:z")
     pose_attr_ori_w = _find_attr("inputs:pose:orientation:w")
 
+    tf_graph_path = "/ROS2TFGraph"
+    tf_nodes_to_create = [
+        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+        ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+        ("PublishBaseTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
+    ]
+    tf_set_values = [
+        ("PublishBaseTF.inputs:parentFrameId", "World"),
+        ("PublishBaseTF.inputs:childFrameId", pose_frame_id),
+        ("PublishBaseTF.inputs:nodeNamespace", ros_namespace),
+        ("PublishBaseTF.inputs:queueSize", queue_size),
+        ("PublishBaseTF.inputs:topicName", "/tf"),
+        ("PublishBaseTF.inputs:staticPublisher", False),
+    ]
+    tf_connections = [
+        ("OnPlaybackTick.outputs:tick", "PublishBaseTF.inputs:execIn"),
+        ("ReadSimTime.outputs:simulationTime", "PublishBaseTF.inputs:timeStamp"),
+        ("ROS2Context.outputs:context", "PublishBaseTF.inputs:context"),
+    ]
+
+    static_tf_specs: list[tuple[str, str, list[float], list[float]]] = []
+    static_tf_specs.append(
+        (
+            "UWCameraTF",
+            str(uw_camera_cfg["ros2_frame_id"]),
+            vec3(uw_camera_cfg["translation"], "sensors.uw_camera.translation"),
+            quat_wxyz_from_rpy_deg(
+                uw_camera_cfg["orientation_rpy_deg"],
+                "sensors.uw_camera.orientation_rpy_deg",
+            ),
+        )
+    )
+    if bool(imaging_sonar_cfg.get("enabled", False)):
+        static_tf_specs.append(
+            (
+                "ImagingSonarTF",
+                str(imaging_sonar_cfg["ros2_frame_id"]),
+                vec3(imaging_sonar_cfg["translation"], "sensors.imaging_sonar.translation"),
+                quat_wxyz_from_rpy_deg(
+                    imaging_sonar_cfg["orientation_rpy_deg"],
+                    "sensors.imaging_sonar.orientation_rpy_deg",
+                ),
+            )
+        )
+    if rtx_lidar_enabled and rtx_lidar_frame_id is not None:
+        static_tf_specs.append(
+            (
+                "RtxLidarTF",
+                rtx_lidar_frame_id,
+                vec3(rtx_lidar_cfg["translation"], "sensors.rtx_lidar.translation"),
+                quat_wxyz_from_rpy_deg(
+                    rtx_lidar_cfg["orientation_rpy_deg"],
+                    "sensors.rtx_lidar.orientation_rpy_deg",
+                ),
+            )
+        )
+    static_tf_specs.append(
+        (
+            "IMUTF",
+            str(imu_cfg["ros2_frame_id"]),
+            vec3(imu_cfg["translation"], "sensors.imu.translation"),
+            quat_wxyz_from_rpy_deg(imu_cfg["orientation_rpy_deg"], "sensors.imu.orientation_rpy_deg"),
+        )
+    )
+    static_tf_specs.append(
+        (
+            "DVLTF",
+            str(dvl_cfg["ros2_frame_id"]),
+            vec3(dvl_cfg["translation"], "sensors.dvl.translation"),
+            quat_wxyz_from_rpy_deg(dvl_cfg["orientation_rpy_deg"], "sensors.dvl.orientation_rpy_deg"),
+        )
+    )
+    for node_name, child_frame_id, translation, orientation_wxyz in static_tf_specs:
+        tf_nodes_to_create.append((node_name, "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
+        tf_set_values.extend(
+            [
+                (f"{node_name}.inputs:parentFrameId", pose_frame_id),
+                (f"{node_name}.inputs:childFrameId", child_frame_id),
+                (f"{node_name}.inputs:translation", [float(translation[0]), float(translation[1]), float(translation[2])]),
+                (
+                    f"{node_name}.inputs:rotation",
+                    [
+                        float(orientation_wxyz[1]),
+                        float(orientation_wxyz[2]),
+                        float(orientation_wxyz[3]),
+                        float(orientation_wxyz[0]),
+                    ],
+                ),
+                (f"{node_name}.inputs:nodeNamespace", ros_namespace),
+                (f"{node_name}.inputs:queueSize", queue_size),
+                (f"{node_name}.inputs:topicName", "/tf_static"),
+                (f"{node_name}.inputs:staticPublisher", True),
+            ]
+        )
+        tf_connections.extend(
+            [
+                ("OnPlaybackTick.outputs:tick", f"{node_name}.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", f"{node_name}.inputs:timeStamp"),
+                ("ROS2Context.outputs:context", f"{node_name}.inputs:context"),
+            ]
+        )
+
+    og.Controller.edit(
+        {"graph_path": tf_graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: tf_nodes_to_create,
+            keys.SET_VALUES: tf_set_values,
+            keys.CONNECT: tf_connections,
+        },
+    )
+    simulation_app.update()
+    base_tf_translation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:translation")
+    base_tf_rotation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:rotation")
+
+    velocity_graph_path = "/ROS2VelocityGraph"
+    og.Controller.edit(
+        {"graph_path": velocity_graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("PublishVelocity", "isaacsim.ros2.bridge.ROS2Publisher"),
+            ],
+            keys.SET_VALUES: [
+                ("PublishVelocity.inputs:topicName", velocity_topic),
+                ("PublishVelocity.inputs:messagePackage", "geometry_msgs"),
+                ("PublishVelocity.inputs:messageSubfolder", "msg"),
+                ("PublishVelocity.inputs:messageName", "Twist"),
+                ("PublishVelocity.inputs:nodeNamespace", ros_namespace),
+                ("PublishVelocity.inputs:queueSize", queue_size),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishVelocity.inputs:execIn"),
+            ],
+        },
+    )
+    simulation_app.update()
+    velocity_pub_node = og.Controller.node(f"{velocity_graph_path}/PublishVelocity")
+    velocity_pub_attrs = {attr.get_name(): attr for attr in velocity_pub_node.get_attributes()}
+    velocity_attr_twist = velocity_pub_attrs.get("inputs:twist")
+    velocity_attr_linear = velocity_pub_attrs.get("inputs:linear")
+    velocity_attr_angular = velocity_pub_attrs.get("inputs:angular")
+    velocity_attr_linear_x = velocity_pub_attrs.get("inputs:linear:x")
+    velocity_attr_linear_y = velocity_pub_attrs.get("inputs:linear:y")
+    velocity_attr_linear_z = velocity_pub_attrs.get("inputs:linear:z")
+    velocity_attr_angular_x = velocity_pub_attrs.get("inputs:angular:x")
+    velocity_attr_angular_y = velocity_pub_attrs.get("inputs:angular:y")
+    velocity_attr_angular_z = velocity_pub_attrs.get("inputs:angular:z")
+
+    acceleration_graph_path = "/ROS2AccelerationGraph"
+    og.Controller.edit(
+        {"graph_path": acceleration_graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("PublishAcceleration", "isaacsim.ros2.bridge.ROS2Publisher"),
+            ],
+            keys.SET_VALUES: [
+                ("PublishAcceleration.inputs:topicName", acceleration_topic),
+                ("PublishAcceleration.inputs:messagePackage", "geometry_msgs"),
+                ("PublishAcceleration.inputs:messageSubfolder", "msg"),
+                ("PublishAcceleration.inputs:messageName", "Twist"),
+                ("PublishAcceleration.inputs:nodeNamespace", ros_namespace),
+                ("PublishAcceleration.inputs:queueSize", queue_size),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishAcceleration.inputs:execIn"),
+            ],
+        },
+    )
+    simulation_app.update()
+    acceleration_pub_node = og.Controller.node(f"{acceleration_graph_path}/PublishAcceleration")
+    acceleration_pub_attrs = {attr.get_name(): attr for attr in acceleration_pub_node.get_attributes()}
+    acceleration_attr_twist = acceleration_pub_attrs.get("inputs:twist")
+    acceleration_attr_linear = acceleration_pub_attrs.get("inputs:linear")
+    acceleration_attr_angular = acceleration_pub_attrs.get("inputs:angular")
+    acceleration_attr_linear_x = acceleration_pub_attrs.get("inputs:linear:x")
+    acceleration_attr_linear_y = acceleration_pub_attrs.get("inputs:linear:y")
+    acceleration_attr_linear_z = acceleration_pub_attrs.get("inputs:linear:z")
+    acceleration_attr_angular_x = acceleration_pub_attrs.get("inputs:angular:x")
+    acceleration_attr_angular_y = acceleration_pub_attrs.get("inputs:angular:y")
+    acceleration_attr_angular_z = acceleration_pub_attrs.get("inputs:angular:z")
+
     # 5) Attach IMU and publish to ROS2.
-    imu_cfg = sensors_cfg["imu"]
     if not bool(imu_cfg["enabled"]):
         raise RuntimeError("sensors.imu.enabled must be true")
 
@@ -802,7 +1183,6 @@ def main() -> None:
     )
 
     # 5) Attach OceanSim DVL and publish to ROS2 odometry topic.
-    dvl_cfg = sensors_cfg["dvl"]
     if not bool(dvl_cfg["enabled"]):
         raise RuntimeError("sensors.dvl.enabled must be true")
 
@@ -973,9 +1353,89 @@ def main() -> None:
                     pose_attr_ori_z.set(quat_xyzw[2])
                 if pose_attr_ori_w is not None:
                     pose_attr_ori_w.set(quat_xyzw[3])
-        pose_vec, v_body, _lin_accel_body, _ang_accel_body, R = _compute_kinematics(
+        if base_tf_translation_attr is not None:
+            base_tf_translation_attr.set([float(pos[0]), float(pos[1]), float(pos[2])])
+        if base_tf_rotation_attr is not None:
+            base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+        pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
             pos, q, lin_world, ang_world
         )
+        if velocity_attr_twist is not None:
+            velocity_attr_twist.set(
+                json.dumps(
+                    {
+                        "linear": {
+                            "x": float(v_body[0]),
+                            "y": float(v_body[1]),
+                            "z": float(v_body[2]),
+                        },
+                        "angular": {
+                            "x": float(v_body[3]),
+                            "y": float(v_body[4]),
+                            "z": float(v_body[5]),
+                        },
+                    }
+                )
+            )
+        else:
+            if velocity_attr_linear is not None:
+                velocity_attr_linear.set([float(v_body[0]), float(v_body[1]), float(v_body[2])])
+            else:
+                if velocity_attr_linear_x is not None:
+                    velocity_attr_linear_x.set(float(v_body[0]))
+                if velocity_attr_linear_y is not None:
+                    velocity_attr_linear_y.set(float(v_body[1]))
+                if velocity_attr_linear_z is not None:
+                    velocity_attr_linear_z.set(float(v_body[2]))
+            if velocity_attr_angular is not None:
+                velocity_attr_angular.set([float(v_body[3]), float(v_body[4]), float(v_body[5])])
+            else:
+                if velocity_attr_angular_x is not None:
+                    velocity_attr_angular_x.set(float(v_body[3]))
+                if velocity_attr_angular_y is not None:
+                    velocity_attr_angular_y.set(float(v_body[4]))
+                if velocity_attr_angular_z is not None:
+                    velocity_attr_angular_z.set(float(v_body[5]))
+        if acceleration_attr_twist is not None:
+            acceleration_attr_twist.set(
+                json.dumps(
+                    {
+                        "linear": {
+                            "x": float(lin_accel_body[0]),
+                            "y": float(lin_accel_body[1]),
+                            "z": float(lin_accel_body[2]),
+                        },
+                        "angular": {
+                            "x": float(ang_accel_body[0]),
+                            "y": float(ang_accel_body[1]),
+                            "z": float(ang_accel_body[2]),
+                        },
+                    }
+                )
+            )
+        else:
+            if acceleration_attr_linear is not None:
+                acceleration_attr_linear.set(
+                    [float(lin_accel_body[0]), float(lin_accel_body[1]), float(lin_accel_body[2])]
+                )
+            else:
+                if acceleration_attr_linear_x is not None:
+                    acceleration_attr_linear_x.set(float(lin_accel_body[0]))
+                if acceleration_attr_linear_y is not None:
+                    acceleration_attr_linear_y.set(float(lin_accel_body[1]))
+                if acceleration_attr_linear_z is not None:
+                    acceleration_attr_linear_z.set(float(lin_accel_body[2]))
+            if acceleration_attr_angular is not None:
+                acceleration_attr_angular.set(
+                    [float(ang_accel_body[0]), float(ang_accel_body[1]), float(ang_accel_body[2])]
+                )
+            else:
+                if acceleration_attr_angular_x is not None:
+                    acceleration_attr_angular_x.set(float(ang_accel_body[0]))
+                if acceleration_attr_angular_y is not None:
+                    acceleration_attr_angular_y.set(float(ang_accel_body[1]))
+                if acceleration_attr_angular_z is not None:
+                    acceleration_attr_angular_z.set(float(ang_accel_body[2]))
         forces = _select_forces()
         tau_total = _compute_tau(v_body, pose_vec, forces)
         _apply_wrench(R, tau_total)
