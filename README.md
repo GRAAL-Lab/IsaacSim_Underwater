@@ -1,14 +1,14 @@
 # IsaacSim Underwater
 
-**GPU-accelerated underwater robotics simulation in NVIDIA Isaac Sim 5.1**, with:
-- A BlueROV-based scene (USD) and underwater environment assets
-- Hydrodynamic vehicle dynamics via **Marine Vehicle Models (MVM)** (Fossen's 6-DOF model)
-- **OceanSim**-based DVL sensor
-- **OceanSim** 2D imaging sonar published as a ROS2 image topic
-- **3D Sonar** (simulated using RTX Lidar) published as ROS2 point clouds
-- Isaac Sim physics IMU
-- RGB camera with in-sim OceanSim underwater rendering
-- ROS2 I/O for closed-loop 
+IsaacSim Underwater is a GPU-accelerated underwater robotics simulation in NVIDIA Isaac Sim 5.1. It packages a full vehicle + sensor stack in one run. The hydrodynamics follow the 6-DOF model described in the reference at the end of this README [1].
+
+1. Hydrodynamic vehicle dynamics (Thor I. Fossen 6-DOF model)
+2. 3D Sonar (Waterlinked 3D-15, simulated with RTX Lidar)
+3. 2D Imaging Sonar (Oculus M750d, OceanSim model)
+4. Underwater Camera (OceanSim model)
+5. DVL (Waterlinked A50, OceanSim model)
+6. Barometer (OceanSim model)
+7. IMU (Isaac Sim physics IMU)
 
 ---
 
@@ -146,7 +146,7 @@ In this repository’s default setup, you typically do **not** need to set `LD_L
 This repository expects an `Assets/` folder containing the USD scenes and sensor definitions, download them from Google Drive and place them here:
 - `IsaacSim_Underwater/Assets/`
 
-**Google Drive link:** `TODO: add link here`
+**Google Drive link:** `https://drive.google.com/drive/folders/1qZrrGMX0y0dMRY5mIX7Zr-NnPO7HEYy7?usp=sharing`
 
 After extracting, you should see files like:
 - `Assets/BlueROV_3D_Sonar.usd`
@@ -155,6 +155,10 @@ After extracting, you should see files like:
 - `Assets/ThreeDSonar_LowFrequency.json`
 
 ---
+
+## Reference
+
+[1] Y. Attia, E. Simetti, G. Indiveri and F. Wanderlingh, "Dynamic Goal-Based Adaptive Line of Sight: An X300 AUV Case-Study," OCEANS 2025 Brest, BREST, France, 2025, pp. 1-7, doi: 10.1109/OCEANS58557.2025.11104519.
 
 ## Quickstart: run the simulation
 

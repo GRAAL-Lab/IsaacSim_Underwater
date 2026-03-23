@@ -310,6 +310,17 @@ def _validate_config(cfg: dict) -> None:
             "sensors.rtx_lidar.show_debug_view",
         ],
     )
+    _require_if_enabled(
+        cfg,
+        "sensors.barometer.enabled",
+        [
+            "sensors.barometer.translation",
+            "sensors.barometer.orientation_rpy_deg",
+            "sensors.barometer.frequency_hz",
+            "sensors.barometer.ros2_topic",
+            "sensors.barometer.ros2_frame_id",
+        ],
+    )
 
 
 def main() -> None:
@@ -373,66 +384,7 @@ def main() -> None:
     from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
     from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
     from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
-    from isaacsim.oceansim.utils.UWrenderer_utils import UW_render
-    import warp as wp
-
-    @wp.kernel
-    def _sonar_resize_rgba(
-        src: wp.array(ndim=3, dtype=wp.uint8),
-        dst: wp.array(ndim=3, dtype=wp.uint8),
-    ):
-        i, j = wp.tid()
-        src_h = src.shape[0]
-        src_w = src.shape[1]
-        dst_h = dst.shape[0]
-        dst_w = dst.shape[1]
-        src_i = wp.min(wp.int32(wp.float32(i) * wp.float32(src_h) / wp.float32(dst_h)), src_h - 1)
-        src_j = wp.min(wp.int32(wp.float32(j) * wp.float32(src_w) / wp.float32(dst_w)), src_w - 1)
-        for c in range(4):
-            dst[i, j, c] = src[src_i, src_j, c]
-
-    @wp.kernel
-    def _sonar_fan_rgba(
-        src: wp.array(ndim=3, dtype=wp.uint8),
-        dst: wp.array(ndim=3, dtype=wp.uint8),
-        half_fov_rad: float,
-        min_radius_norm: float,
-    ):
-        i, j = wp.tid()
-        dst_h = dst.shape[0]
-        dst_w = dst.shape[1]
-        src_h = src.shape[0]
-        src_w = src.shape[1]
-
-        x = wp.float32(j)
-        y = wp.float32(i)
-        cx = wp.float32(dst_w - 1) * 0.5
-        cy = wp.float32(dst_h - 1)
-        dx = x - cx
-        dy = cy - y
-
-        valid = False
-        if dy >= 0.0:
-            theta = wp.atan2(dx, wp.max(dy, wp.float32(1.0e-6)))
-            radius_norm = wp.sqrt(dx * dx + dy * dy) / wp.max(cy, wp.float32(1.0))
-            if (
-                wp.abs(theta) <= half_fov_rad
-                and radius_norm >= min_radius_norm
-                and radius_norm <= 1.0
-            ):
-                theta_norm = (theta + half_fov_rad) / wp.max(2.0 * half_fov_rad, wp.float32(1.0e-6))
-                radius_scaled = (radius_norm - min_radius_norm) / wp.max(1.0 - min_radius_norm, wp.float32(1.0e-6))
-                src_j = wp.min(wp.int32(theta_norm * wp.float32(src_w - 1) + 0.5), src_w - 1)
-                src_i = wp.min(wp.int32(radius_scaled * wp.float32(src_h - 1) + 0.5), src_h - 1)
-                for c in range(4):
-                    dst[i, j, c] = src[src_i, src_j, c]
-                valid = True
-
-        if not valid:
-            dst[i, j, 0] = wp.uint8(0)
-            dst[i, j, 1] = wp.uint8(0)
-            dst[i, j, 2] = wp.uint8(0)
-            dst[i, j, 3] = wp.uint8(255)
+    # Sonar fan mapping now lives in the OceanSim sensor module.
     simulation_app.update()
 
     # 1) Load world map USD.
@@ -604,147 +556,74 @@ def main() -> None:
 
     # 3) Attach OceanSim camera and publish raw + underwater images.
     uw_camera_cfg = sensors_cfg["uw_camera"]
-    if not bool(uw_camera_cfg["enabled"]):
-        raise RuntimeError("sensors.uw_camera.enabled must be true")
+    uw_camera = None
+    processed_image_data_attr = None
+    processed_image_buffer_size_attr = None
+    processed_image_width_attr = None
+    processed_image_height_attr = None
+    if bool(uw_camera_cfg["enabled"]):
+        processed_topic = str(
+            uw_camera_cfg.get("ros2_processed_topic", _default_processed_image_topic(str(uw_camera_cfg["ros2_topic"])))
+        ).strip()
 
-    processed_topic = str(
-        uw_camera_cfg.get("ros2_processed_topic", _default_processed_image_topic(str(uw_camera_cfg["ros2_topic"])))
-    ).strip()
-
-    uw_camera = UW_Camera(
-        prim_path=str(uw_camera_cfg["prim_path"]),
-        name=str(uw_camera_cfg.get("name", "UWCamFront")),
-        frequency=float(uw_camera_cfg["frequency_hz"]),
-        resolution=[int(uw_camera_cfg["resolution"][0]), int(uw_camera_cfg["resolution"][1])],
-        translation=vec3(uw_camera_cfg["translation"], "sensors.uw_camera.translation"),
-        orientation=quat_wxyz_from_rpy_deg(
-            uw_camera_cfg["orientation_rpy_deg"],
-            "sensors.uw_camera.orientation_rpy_deg",
-        ),
-    )
-
-    uw_camera.initialize(
-        UW_param=_build_oceansim_uw_params(uw_camera_cfg),
-        viewport=False,
-        enable_ros2_pub=False,
-    )
-
-    camera_graph_path = "/ROS2UWCameraGraph"
-    camera_frame_skip = max(0, int(round(render_fps / max(float(uw_camera_cfg["frequency_hz"]), 1e-6))) - 1)
-    og.Controller.edit(
-        {"graph_path": camera_graph_path, "evaluator_name": "execution"},
-        {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("CameraHelperRgb", "isaacsim.ros2.bridge.ROS2CameraHelper"),
-                ("CameraHelperInfo", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
-            ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "CameraHelperRgb.inputs:execIn"),
-                ("OnPlaybackTick.outputs:tick", "CameraHelperInfo.inputs:execIn"),
-            ],
-            keys.SET_VALUES: [
-                ("CameraHelperRgb.inputs:renderProductPath", uw_camera._render_product_path),
-                ("CameraHelperRgb.inputs:topicName", str(uw_camera_cfg["ros2_topic"])),
-                ("CameraHelperRgb.inputs:frameId", str(uw_camera_cfg["ros2_frame_id"])),
-                ("CameraHelperRgb.inputs:type", "rgb"),
-                ("CameraHelperRgb.inputs:queueSize", queue_size),
-                ("CameraHelperRgb.inputs:nodeNamespace", ros_namespace),
-                ("CameraHelperRgb.inputs:frameSkipCount", camera_frame_skip),
-                ("CameraHelperInfo.inputs:renderProductPath", uw_camera._render_product_path),
-                ("CameraHelperInfo.inputs:topicName", str(uw_camera_cfg["ros2_camera_info_topic"])),
-                ("CameraHelperInfo.inputs:frameId", str(uw_camera_cfg["ros2_frame_id"])),
-                ("CameraHelperInfo.inputs:queueSize", queue_size),
-                ("CameraHelperInfo.inputs:nodeNamespace", ros_namespace),
-                ("CameraHelperInfo.inputs:frameSkipCount", camera_frame_skip),
-            ],
-        },
-    )
-
-    processed_graph_path = "/ROS2ProcessedUWCameraGraph"
-    og.Controller.edit(
-        {"graph_path": processed_graph_path, "evaluator_name": "execution"},
-        {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-                ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
-                ("ProcessedImagePub", "isaacsim.ros2.bridge.ROS2PublishImage"),
-            ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "ProcessedImagePub.inputs:execIn"),
-                ("ReadSimTime.outputs:simulationTime", "ProcessedImagePub.inputs:timeStamp"),
-                ("ROS2Context.outputs:context", "ProcessedImagePub.inputs:context"),
-            ],
-            keys.SET_VALUES: [
-                ("ProcessedImagePub.inputs:topicName", processed_topic),
-                ("ProcessedImagePub.inputs:frameId", str(uw_camera_cfg["ros2_frame_id"])),
-                ("ProcessedImagePub.inputs:encoding", "rgb8"),
-                ("ProcessedImagePub.inputs:queueSize", queue_size),
-                ("ProcessedImagePub.inputs:nodeNamespace", ros_namespace),
-                ("ProcessedImagePub.inputs:cudaDeviceIndex", -1),
-                ("ProcessedImagePub.inputs:width", int(uw_camera_cfg["resolution"][0])),
-                ("ProcessedImagePub.inputs:height", int(uw_camera_cfg["resolution"][1])),
-            ],
-        },
-    )
-    simulation_app.update()
-    processed_image_data_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:data")
-    processed_image_buffer_size_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:bufferSize")
-    processed_image_width_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:width")
-    processed_image_height_attr = og.Controller.attribute(f"{processed_graph_path}/ProcessedImagePub.inputs:height")
-    processed_image_width = int(uw_camera_cfg["resolution"][0])
-    processed_image_height = int(uw_camera_cfg["resolution"][1])
-    processed_image_zero_frame = np.zeros((processed_image_height, processed_image_width, 3), dtype=np.uint8)
-    if processed_image_width_attr is not None:
-        processed_image_width_attr.set(processed_image_width)
-    if processed_image_height_attr is not None:
-        processed_image_height_attr.set(processed_image_height)
-    if processed_image_buffer_size_attr is not None:
-        processed_image_buffer_size_attr.set(int(processed_image_zero_frame.size))
-    if processed_image_data_attr is not None:
-        processed_image_data_attr.set(processed_image_zero_frame.reshape(-1))
-
-    def _render_underwater_frame_rgb() -> np.ndarray | None:
-        raw_rgba = uw_camera._rgba_annot.get_data()
-        depth = uw_camera._depth_annot.get_data()
-        if raw_rgba.size == 0 or depth.size == 0:
-            return None
-
-        uw_image = wp.zeros_like(raw_rgba)
-        wp.launch(
-            dim=np.flip(uw_camera.get_resolution()),
-            kernel=UW_render,
-            inputs=[
-                raw_rgba,
-                depth,
-                uw_camera._backscatter_value,
-                uw_camera._atten_coeff,
-                uw_camera._backscatter_coeff,
-            ],
-            outputs=[uw_image],
+        uw_camera = UW_Camera(
+            prim_path=str(uw_camera_cfg["prim_path"]),
+            name=str(uw_camera_cfg.get("name", "UWCamFront")),
+            frequency=float(uw_camera_cfg["frequency_hz"]),
+            resolution=[int(uw_camera_cfg["resolution"][0]), int(uw_camera_cfg["resolution"][1])],
+            translation=vec3(uw_camera_cfg["translation"], "sensors.uw_camera.translation"),
+            orientation=quat_wxyz_from_rpy_deg(
+                uw_camera_cfg["orientation_rpy_deg"],
+                "sensors.uw_camera.orientation_rpy_deg",
+            ),
         )
 
-        if uw_camera._viewport:
-            uw_camera._provider.set_bytes_data_from_gpu(uw_image.ptr, uw_camera.get_resolution())
-        uw_rgba = uw_image.numpy()
-        return np.ascontiguousarray(uw_rgba[:, :, :3])
+        uw_camera.initialize(
+            UW_param=_build_oceansim_uw_params(uw_camera_cfg),
+            viewport=False,
+        )
 
-    def _publish_processed_frame(frame_rgb: np.ndarray) -> None:
-        if processed_image_data_attr is None or processed_image_buffer_size_attr is None:
-            return
-        if processed_image_width_attr is not None:
-            processed_image_width_attr.set(int(frame_rgb.shape[1]))
-        if processed_image_height_attr is not None:
-            processed_image_height_attr.set(int(frame_rgb.shape[0]))
-        processed_image_buffer_size_attr.set(int(frame_rgb.size))
-        processed_image_data_attr.set(frame_rgb.reshape(-1))
+        camera_graph_path = "/ROS2UWCameraGraph"
+        camera_frame_skip = max(0, int(round(render_fps / max(float(uw_camera_cfg["frequency_hz"]), 1e-6))) - 1)
+        og.Controller.edit(
+            {"graph_path": camera_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: [
+                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("CameraHelperRgb", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                    ("CameraHelperInfo", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
+                ],
+                keys.CONNECT: [
+                    ("OnPlaybackTick.outputs:tick", "CameraHelperRgb.inputs:execIn"),
+                    ("OnPlaybackTick.outputs:tick", "CameraHelperInfo.inputs:execIn"),
+                ],
+                keys.SET_VALUES: [
+                    ("CameraHelperRgb.inputs:renderProductPath", uw_camera._render_product_path),
+                    ("CameraHelperRgb.inputs:topicName", str(uw_camera_cfg["ros2_topic"])),
+                    ("CameraHelperRgb.inputs:frameId", str(uw_camera_cfg["ros2_frame_id"])),
+                    ("CameraHelperRgb.inputs:type", "rgb"),
+                    ("CameraHelperRgb.inputs:queueSize", queue_size),
+                    ("CameraHelperRgb.inputs:nodeNamespace", ros_namespace),
+                    ("CameraHelperRgb.inputs:frameSkipCount", camera_frame_skip),
+                    ("CameraHelperInfo.inputs:renderProductPath", uw_camera._render_product_path),
+                    ("CameraHelperInfo.inputs:topicName", str(uw_camera_cfg["ros2_camera_info_topic"])),
+                    ("CameraHelperInfo.inputs:frameId", str(uw_camera_cfg["ros2_frame_id"])),
+                    ("CameraHelperInfo.inputs:queueSize", queue_size),
+                    ("CameraHelperInfo.inputs:nodeNamespace", ros_namespace),
+                    ("CameraHelperInfo.inputs:frameSkipCount", camera_frame_skip),
+                ],
+            },
+        )
+
+        uw_camera.setup_processed_ros2_publisher(
+            topic_name=processed_topic,
+            frame_id=str(uw_camera_cfg["ros2_frame_id"]),
+            ros_namespace=ros_namespace,
+            queue_size=queue_size,
+            graph_path="/ROS2ProcessedUWCameraGraph",
+        )
 
     imaging_sonar = None
-    imaging_sonar_data_attr = None
-    imaging_sonar_buffer_size_attr = None
-    imaging_sonar_width_attr = None
-    imaging_sonar_height_attr = None
     imaging_sonar_cfg = sensors_cfg.get("imaging_sonar", {})
     if bool(imaging_sonar_cfg.get("enabled", False)):
         imaging_sonar = ImagingSonarSensor(
@@ -769,82 +648,30 @@ def main() -> None:
             viewport=False,
             include_unlabelled=True,
             if_array_copy=True,
+            fetch_on_device=bool(imaging_sonar_cfg.get("fetch_on_device", False)),
         )
-        imaging_sonar_device = wp.get_preferred_device()
-        imaging_sonar_device_str = str(imaging_sonar_device)
-        if not imaging_sonar_device_str.startswith("cuda:"):
-            raise RuntimeError("Imaging sonar GPU-only streaming requires a CUDA Warp device")
-        imaging_sonar_cuda_device_index = int(imaging_sonar_device_str.split(":", 1)[1])
         imaging_sonar_stream_width = int(imaging_sonar_cfg.get("stream_width", imaging_sonar.sonar_map.shape[1]))
         imaging_sonar_stream_height = int(imaging_sonar_cfg.get("stream_height", imaging_sonar.sonar_map.shape[0]))
-        imaging_sonar_stream_buffer_count = max(2, int(imaging_sonar_cfg.get("stream_buffer_count", 3)))
-        imaging_sonar_stream_rgba_buffers = [
-            wp.zeros(
-                shape=(imaging_sonar_stream_height, imaging_sonar_stream_width, 4),
-                dtype=wp.uint8,
-                device=imaging_sonar_device,
-            )
-            for _ in range(imaging_sonar_stream_buffer_count)
-        ]
-        imaging_sonar_render_buffer_index = 0
-        imaging_sonar_publish_buffer_index = 0
-
-        imaging_sonar_graph_path = "/ROS2ImagingSonarGraph"
-        og.Controller.edit(
-            {"graph_path": imaging_sonar_graph_path, "evaluator_name": "execution"},
-            {
-                keys.CREATE_NODES: [
-                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                    ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-                    ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
-                    ("PublishSonarImage", "isaacsim.ros2.bridge.ROS2PublishImage"),
-                ],
-                keys.CONNECT: [
-                    ("OnPlaybackTick.outputs:tick", "PublishSonarImage.inputs:execIn"),
-                    ("ReadSimTime.outputs:simulationTime", "PublishSonarImage.inputs:timeStamp"),
-                    ("ROS2Context.outputs:context", "PublishSonarImage.inputs:context"),
-                ],
-                keys.SET_VALUES: [
-                    ("PublishSonarImage.inputs:topicName", str(imaging_sonar_cfg["ros2_topic"])),
-                    ("PublishSonarImage.inputs:frameId", str(imaging_sonar_cfg["ros2_frame_id"])),
-                    ("PublishSonarImage.inputs:queueSize", queue_size),
-                    ("PublishSonarImage.inputs:nodeNamespace", ros_namespace),
-                    ("PublishSonarImage.inputs:encoding", "rgba8"),
-                    ("PublishSonarImage.inputs:cudaDeviceIndex", imaging_sonar_cuda_device_index),
-                    ("PublishSonarImage.inputs:width", imaging_sonar_stream_width),
-                    ("PublishSonarImage.inputs:height", imaging_sonar_stream_height),
-                ],
-            },
+        imaging_sonar.setup_ros2_publisher(
+            topic_name=str(imaging_sonar_cfg["ros2_topic"]),
+            frame_id=str(imaging_sonar_cfg["ros2_frame_id"]),
+            ros_namespace=ros_namespace,
+            queue_size=queue_size,
+            stream_width=imaging_sonar_stream_width,
+            stream_height=imaging_sonar_stream_height,
+            graph_path="/ROS2ImagingSonarGraph",
         )
-        simulation_app.update()
-        imaging_sonar_data_attr = og.Controller.attribute(f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:data")
-        imaging_sonar_data_ptr_attr = og.Controller.attribute(
-            f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:dataPtr"
-        )
-        imaging_sonar_buffer_size_attr = og.Controller.attribute(
-            f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:bufferSize"
-        )
-        imaging_sonar_width_attr = og.Controller.attribute(f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:width")
-        imaging_sonar_height_attr = og.Controller.attribute(
-            f"{imaging_sonar_graph_path}/PublishSonarImage.inputs:height"
-        )
-        if imaging_sonar_width_attr is not None:
-            imaging_sonar_width_attr.set(imaging_sonar_stream_width)
-        if imaging_sonar_height_attr is not None:
-            imaging_sonar_height_attr.set(imaging_sonar_stream_height)
-        if imaging_sonar_buffer_size_attr is not None:
-            imaging_sonar_buffer_size_attr.set(imaging_sonar_stream_width * imaging_sonar_stream_height * 4)
-        if imaging_sonar_data_ptr_attr is not None:
-            imaging_sonar_data_ptr_attr.set(int(imaging_sonar_stream_rgba_buffers[0].ptr))
-        if imaging_sonar_data_attr is not None:
-            imaging_sonar_data_attr.set([])
 
     def _render_imaging_sonar_frame() -> bool:
-        nonlocal imaging_sonar_render_buffer_index, imaging_sonar_publish_buffer_index
         if imaging_sonar is None:
             return False
         processing_cfg = imaging_sonar_cfg.get("processing", {})
-        imaging_sonar.make_sonar_data(
+        return imaging_sonar.step_render_publish(
+            stream_width=imaging_sonar_stream_width,
+            stream_height=imaging_sonar_stream_height,
+            min_range_m=float(imaging_sonar_cfg.get("min_range_m", 0.2)),
+            max_range_m=float(imaging_sonar_cfg.get("max_range_m", 3.0)),
+            horizontal_fov_deg=float(imaging_sonar_cfg.get("horizontal_fov_deg", 130.0)),
             binning_method=str(processing_cfg.get("binning_method", "sum")),
             normalizing_method=str(processing_cfg.get("normalizing_method", "range")),
             attenuation=float(processing_cfg.get("attenuation", 0.1)),
@@ -855,45 +682,11 @@ def main() -> None:
             central_peak=float(processing_cfg.get("central_peak", 2.0)),
             central_std=float(processing_cfg.get("central_std", 0.001)),
         )
-        sonar_rgba = imaging_sonar.make_sonar_image()
-        render_buffer = imaging_sonar_stream_rgba_buffers[imaging_sonar_render_buffer_index]
-        half_fov_rad = 0.5 * np.deg2rad(float(imaging_sonar_cfg.get("horizontal_fov_deg", 130.0)))
-        min_range_m = float(imaging_sonar_cfg.get("min_range_m", 0.2))
-        max_range_m = float(imaging_sonar_cfg.get("max_range_m", 3.0))
-        min_radius_norm = 0.0
-        if max_range_m > min_range_m and min_range_m > 0.0:
-            min_radius_norm = float(np.clip(min_range_m / max_range_m, 0.0, 0.99))
-        wp.launch(
-            dim=(imaging_sonar_stream_height, imaging_sonar_stream_width),
-            kernel=_sonar_fan_rgba,
-            inputs=[
-                sonar_rgba,
-                render_buffer,
-                half_fov_rad,
-                min_radius_norm,
-            ],
-        )
-        imaging_sonar_publish_buffer_index = imaging_sonar_render_buffer_index
-        imaging_sonar_render_buffer_index = (
-            imaging_sonar_render_buffer_index + 1
-        ) % imaging_sonar_stream_buffer_count
-        return True
-
-    def _publish_imaging_sonar_frame() -> None:
-        if imaging_sonar_data_ptr_attr is None or imaging_sonar_buffer_size_attr is None:
-            return
-        if imaging_sonar_width_attr is not None:
-            imaging_sonar_width_attr.set(imaging_sonar_stream_width)
-        if imaging_sonar_height_attr is not None:
-            imaging_sonar_height_attr.set(imaging_sonar_stream_height)
-        imaging_sonar_buffer_size_attr.set(imaging_sonar_stream_width * imaging_sonar_stream_height * 4)
-        imaging_sonar_data_ptr_attr.set(
-            int(imaging_sonar_stream_rgba_buffers[imaging_sonar_publish_buffer_index].ptr)
-        )
 
     # 4) Publish robot pose to ROS2.
     imu_cfg = sensors_cfg["imu"]
     dvl_cfg = sensors_cfg["dvl"]
+    baro_cfg = sensors_cfg.get("barometer", {})
     pose_graph_path = "/ROS2PoseGraph"
     pose_frame_id = robot_prim_path.rsplit("/", 1)[-1] or "base_link"
     pose_topic = str(robot_cfg["pose_topic"]).strip()
@@ -971,17 +764,18 @@ def main() -> None:
     ]
 
     static_tf_specs: list[tuple[str, str, list[float], list[float]]] = []
-    static_tf_specs.append(
-        (
-            "UWCameraTF",
-            str(uw_camera_cfg["ros2_frame_id"]),
-            vec3(uw_camera_cfg["translation"], "sensors.uw_camera.translation"),
-            quat_wxyz_from_rpy_deg(
-                uw_camera_cfg["orientation_rpy_deg"],
-                "sensors.uw_camera.orientation_rpy_deg",
-            ),
+    if bool(uw_camera_cfg["enabled"]):
+        static_tf_specs.append(
+            (
+                "UWCameraTF",
+                str(uw_camera_cfg["ros2_frame_id"]),
+                vec3(uw_camera_cfg["translation"], "sensors.uw_camera.translation"),
+                quat_wxyz_from_rpy_deg(
+                    uw_camera_cfg["orientation_rpy_deg"],
+                    "sensors.uw_camera.orientation_rpy_deg",
+                ),
+            )
         )
-    )
     if bool(imaging_sonar_cfg.get("enabled", False)):
         static_tf_specs.append(
             (
@@ -1022,6 +816,18 @@ def main() -> None:
             quat_wxyz_from_rpy_deg(dvl_cfg["orientation_rpy_deg"], "sensors.dvl.orientation_rpy_deg"),
         )
     )
+    if bool(baro_cfg.get("enabled", False)):
+        static_tf_specs.append(
+            (
+                "BarometerTF",
+                str(baro_cfg["ros2_frame_id"]),
+                vec3(baro_cfg["translation"], "sensors.barometer.translation"),
+                quat_wxyz_from_rpy_deg(
+                    baro_cfg["orientation_rpy_deg"],
+                    "sensors.barometer.orientation_rpy_deg",
+                ),
+            )
+        )
     for node_name, child_frame_id, translation, orientation_wxyz in static_tf_specs:
         tf_nodes_to_create.append((node_name, "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
         tf_set_values.extend(
@@ -1131,6 +937,57 @@ def main() -> None:
     acceleration_attr_angular_x = acceleration_pub_attrs.get("inputs:angular:x")
     acceleration_attr_angular_y = acceleration_pub_attrs.get("inputs:angular:y")
     acceleration_attr_angular_z = acceleration_pub_attrs.get("inputs:angular:z")
+
+    baro_enabled = bool(baro_cfg.get("enabled", False))
+    baro_pub_node = None
+    baro_attr_header = None
+    baro_attr_frame_id = None
+    baro_attr_stamp_sec = None
+    baro_attr_stamp_nsec = None
+    baro_attr_pressure = None
+    baro_attr_variance = None
+    baro_last_pub_time = -1.0
+    baro_period = 0.0
+    if baro_enabled:
+        baro_frequency = float(baro_cfg.get("frequency_hz", 10.0))
+        baro_period = 1.0 / baro_frequency if baro_frequency > 0.0 else 0.0
+        baro_graph_path = "/ROS2BarometerGraph"
+        og.Controller.edit(
+            {"graph_path": baro_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: [
+                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("PublishBarometer", "isaacsim.ros2.bridge.ROS2Publisher"),
+                ],
+                keys.SET_VALUES: [
+                    ("PublishBarometer.inputs:topicName", str(baro_cfg["ros2_topic"])),
+                    ("PublishBarometer.inputs:messagePackage", "sensor_msgs"),
+                    ("PublishBarometer.inputs:messageSubfolder", "msg"),
+                    ("PublishBarometer.inputs:messageName", "FluidPressure"),
+                    ("PublishBarometer.inputs:nodeNamespace", ros_namespace),
+                    ("PublishBarometer.inputs:queueSize", queue_size),
+                ],
+                keys.CONNECT: [
+                    ("OnPlaybackTick.outputs:tick", "PublishBarometer.inputs:execIn"),
+                ],
+            },
+        )
+        simulation_app.update()
+        baro_pub_node = og.Controller.node(f"{baro_graph_path}/PublishBarometer")
+        baro_pub_attrs = {attr.get_name(): attr for attr in baro_pub_node.get_attributes()}
+
+        def _baro_find_attr(*names: str):
+            for name in names:
+                if name in baro_pub_attrs:
+                    return baro_pub_attrs[name]
+            return None
+
+        baro_attr_header = _baro_find_attr("inputs:header")
+        baro_attr_frame_id = _baro_find_attr("inputs:header:frame_id", "inputs:header:frameId", "inputs:frameId")
+        baro_attr_stamp_sec = _baro_find_attr("inputs:header:stamp:sec")
+        baro_attr_stamp_nsec = _baro_find_attr("inputs:header:stamp:nanosec")
+        baro_attr_pressure = _baro_find_attr("inputs:fluid_pressure", "inputs:fluidPressure", "inputs:pressure")
+        baro_attr_variance = _baro_find_attr("inputs:variance")
 
     # 5) Attach IMU and publish to ROS2.
     if not bool(imu_cfg["enabled"]):
@@ -1295,6 +1152,7 @@ def main() -> None:
         )
 
     def _on_physics_step(_step_size: float) -> None:
+        nonlocal baro_last_pub_time
         state = _read_state()
         if state is None:
             return
@@ -1357,6 +1215,38 @@ def main() -> None:
             base_tf_translation_attr.set([float(pos[0]), float(pos[1]), float(pos[2])])
         if base_tf_rotation_attr is not None:
             base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+        if baro_enabled and baro_pub_node is not None:
+            sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
+            if baro_period <= 0.0 or baro_last_pub_time < 0.0 or (sim_time - baro_last_pub_time) >= baro_period:
+                baro_last_pub_time = sim_time
+                sec = int(sim_time)
+                nanosec = int((sim_time - sec) * 1e9)
+                surface_z = float(baro_cfg.get("surface_z", 0.0))
+                depth = max(0.0, surface_z - float(pos[2]))
+                fluid_density = float(baro_cfg.get("fluid_density", 1025.0))
+                gravity = float(baro_cfg.get("gravity", 9.80665))
+                surface_pressure = float(baro_cfg.get("surface_pressure", 101325.0))
+                pressure = surface_pressure + fluid_density * gravity * depth
+                variance = float(baro_cfg.get("variance", 0.0))
+                if baro_attr_header is not None:
+                    baro_attr_header.set(
+                        json.dumps(
+                            {
+                                "frame_id": str(baro_cfg["ros2_frame_id"]),
+                                "stamp": {"sec": sec, "nanosec": nanosec},
+                            }
+                        )
+                    )
+                if baro_attr_frame_id is not None:
+                    baro_attr_frame_id.set(str(baro_cfg["ros2_frame_id"]))
+                if baro_attr_stamp_sec is not None:
+                    baro_attr_stamp_sec.set(sec)
+                if baro_attr_stamp_nsec is not None:
+                    baro_attr_stamp_nsec.set(nanosec)
+                if baro_attr_pressure is not None:
+                    baro_attr_pressure.set(float(pressure))
+                if baro_attr_variance is not None:
+                    baro_attr_variance.set(float(variance))
         pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
             pos, q, lin_world, ang_world
         )
@@ -1439,8 +1329,7 @@ def main() -> None:
         forces = _select_forces()
         tau_total = _compute_tau(v_body, pose_vec, forces)
         _apply_wrench(R, tau_total)
-        if _render_imaging_sonar_frame():
-            _publish_imaging_sonar_frame()
+        _render_imaging_sonar_frame()
 
     simulation_app.update()
     world.reset()
@@ -1457,9 +1346,8 @@ def main() -> None:
         main_loop_frame = 0
         while simulation_app.is_running():
             world.step(render=True)
-            processed_frame = _render_underwater_frame_rgb()
-            if processed_frame is not None:
-                _publish_processed_frame(processed_frame)
+            if uw_camera is not None:
+                uw_camera.step_processed()
 
             velocity = dvl_sensor.get_linear_vel_fd(physics_dt=1.0 / physics_hz)
             if isinstance(velocity, np.ndarray) and velocity.shape[0] >= 3:
@@ -1469,7 +1357,8 @@ def main() -> None:
         world.remove_physics_callback("mvm_dynamics")
         if imaging_sonar is not None:
             imaging_sonar.close()
-        uw_camera.close()
+        if uw_camera is not None:
+            uw_camera.close()
         world.stop()
         simulation_app.close()
 

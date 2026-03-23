@@ -45,10 +45,10 @@
         0.0
       ],
       "resolution": [
-        1280,
-        720
+        1920,
+        1080
       ],
-      "frequency_hz": 15,
+      "frequency_hz": 30.0,
       "uw_effects": {
         "backscatter_value": [
           0.0,
@@ -75,6 +75,7 @@
       "enabled": true,
       "name": "ImagingSonarFront",
       "prim_path": "/World/BROV_low/sonar",
+      "fetch_on_device": true,
       "translation": [
         0.2,
         0.0,
@@ -115,33 +116,33 @@
       "config_path": "/home/attia/IsaacSim_Underwater/Assets/ThreeDSonar_LowFrequency.json",
       "prim_path": "/World/BROV_low/ThreeDSonar",
       "translation": [
-        0.2,
-        0.0,
-        0.2
+        0.09382,
+        -0.02148,
+        0.11593
       ],
       "orientation_rpy_deg": [
         0.0,
-        0.0,
+        15.0,
         0.0
       ],
       "ros2_topic": "/IsaacSim/rtx_lidar/point_cloud",
       "ros2_frame_id": "three_d_sonar_link",
       "frame_skip_count": 0,
-      "show_debug_view": true
+      "show_debug_view": false
     },
     "dvl": {
       "enabled": true,
       "name": "DVL",
       "attach_to_prim_path": "/World/BROV_low",
       "translation": [
-        0.0,
-        0.0,
-        0.0
+        -0.079,
+        -0.09691,
+        -0.25938
       ],
       "orientation_rpy_deg": [
         0.0,
         0.0,
-        -0.2
+        0.0
       ],
       "frequency_hz": 10,
       "ros2_topic": "/IsaacSim/dvl/odom",
@@ -171,6 +172,27 @@
       "frequency_hz": 100,
       "ros2_topic": "/IsaacSim/imu",
       "ros2_frame_id": "imu_link"
+    },
+    "barometer": {
+      "enabled": true,
+      "translation": [
+        -0.24219,
+        -0.03954,
+        0.01898
+      ],
+      "orientation_rpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "frequency_hz": 100.0,
+      "ros2_topic": "/IsaacSim/barometer",
+      "ros2_frame_id": "barometer_link",
+      "surface_z": 0.0,
+      "fluid_density": 1025.0,
+      "gravity": 9.80665,
+      "surface_pressure": 101325.0,
+      "variance": 0.0
     }
   },
   "mvm": {
