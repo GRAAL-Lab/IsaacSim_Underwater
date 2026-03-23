@@ -36,21 +36,22 @@ Make sure **OceanSim is present** in one of these locations:
 - `$OCEANSIM_ROOT` (preferred), or
 - `$ISAACSIM_ROOT/extsUser/OceanSim`
 
-OceanSim upstream (ROS2-enabled version used in this project):
-- https://github.com/umfieldrobotics/OceanSim
+OceanSim fork used in this project:
+- https://github.com/GRAAL-Lab/OceanSim
 
-Typical setup (clone into Isaac Sim `extsUser/` and checkout the ROS2-enabled branch):
+Typical setup (clone into Isaac Sim `extsUser/` and checkout the required branch):
 ```bash
 export ISAACSIM_ROOT=/path/to/isaac-sim-5.1
 
 mkdir -p "$ISAACSIM_ROOT/extsUser"
 cd "$ISAACSIM_ROOT/extsUser"
 
-git clone https://github.com/umfieldrobotics/OceanSim.git
+git clone git@github.com:GRAAL-Lab/OceanSim.git
 cd OceanSim
 
-# Note: the exact branch name may differ; use the ROS2 branch described in OceanSim docs.
-git checkout ros2 || true
+# Switch to a specific branch (example: gpu-ros2-publish)
+git fetch origin
+git checkout -b gpu-ros2-publish origin/gpu-ros2-publish
 ```
 
 ### 3) ROS 2 + Isaac Sim ROS2 bridge
@@ -288,6 +289,7 @@ Behavior:
 
 Relevant config keys:
 - `sensors.imaging_sonar.prim_path`, `translation`, `orientation_rpy_deg`
+- `sensors.imaging_sonar.fetch_on_device`
 - `sensors.imaging_sonar.frequency_hz`
 - `sensors.imaging_sonar.min_range_m`, `max_range_m`
 - `sensors.imaging_sonar.range_resolution_m`, `angular_resolution_deg`
@@ -348,7 +350,11 @@ Important:
 - reflectivity semantics are always applied recursively from `/World`
 - the displayed sonar stream can be resized independently of the raw sonar binning using `stream_width` and `stream_height`
 - the sonar stream is always remapped into a fan-style display before streaming
-- the current sonar display path stays on GPU and publishes through `ROS2PublishImage` using a GPU buffer pointer
+- `fetch_on_device=false` is the recommended stable mode in the current implementation
+  - it fetches Replicator pointcloud data on host, then uploads the arrays into Warp explicitly
+- `fetch_on_device=true` keeps the older direct device-fetch path
+  - it may be faster, but it was the less stable path in our Isaac Sim 5.1 testing
+- the current streamed fan image still publishes through `ROS2PublishImage` using a GPU buffer pointer after sonar processing
 
 ---
 
@@ -366,6 +372,7 @@ Notable keys:
 - `sensors.uw_camera.ros2_processed_topic`: processed underwater image topic
 - `sensors.imaging_sonar.*`: OceanSim 2D imaging sonar pose, processing, and ROS topic
   - includes stream sizing via `stream_width` / `stream_height`
+  - includes stability/performance mode via `fetch_on_device`
 - `mvm.config_path`: libconfig file for vehicle parameters (default: `config/BlueROV.conf`)
 
 ---
