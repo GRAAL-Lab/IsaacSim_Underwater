@@ -1,8 +1,8 @@
 {
   "simulation": {
     "app": {
-      "headless": true  ,
-      "disable_viewport_updates": true,
+      "headless": false  ,
+      "disable_viewport_updates": false,
       "enable_motion_bvh": true
     },
     "timing": {

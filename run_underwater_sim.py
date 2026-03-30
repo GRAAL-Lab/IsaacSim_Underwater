@@ -1415,10 +1415,6 @@ def main() -> None:
                 if sleep_ms > 0.0:
                     time.sleep(sleep_ms / 1000.0)
                     loop_ms = (time.perf_counter() - loop_start) * 1000.0
-            print(
-                f"[main_loop] frame {main_loop_frame} total {loop_ms:.3f} ms | "
-                f"world.step {step_ms:.3f} ms | uw_camera {camera_ms:.3f} ms | dvl {dvl_ms:.3f} ms"
-            )
             main_loop_frame += 1
     finally:
         world.remove_physics_callback("mvm_dynamics")
