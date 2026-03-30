@@ -1,14 +1,14 @@
 {
   "simulation": {
     "app": {
-      "headless": false  ,
-      "disable_viewport_updates": false,
+      "headless": true  ,
+      "disable_viewport_updates": true,
       "enable_motion_bvh": true
     },
     "timing": {
       "physics_hz": 120.0,
       "render_fps": 30.0,
-      "realtime": true
+      "realtime": false
     }
   },
   "map": {
@@ -32,7 +32,7 @@
   },
   "sensors": {
     "uw_camera": {
-      "enabled": true,
+      "enabled": false,
       "name": "UWCamFront",
       "prim_path": "/World/BROV_low/UWCamFront",
       "translation": [
@@ -73,7 +73,7 @@
       "ros2_frame_id": "uw_camera_link"
     },
     "imaging_sonar": {
-      "enabled": true,
+      "enabled": false,
       "name": "ImagingSonarFront",
       "prim_path": "/World/BROV_low/sonar",
       "fetch_on_device": true,

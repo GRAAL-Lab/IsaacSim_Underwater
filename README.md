@@ -288,7 +288,7 @@ The script sets up ROS2 graphs for:
   - `sensors.rtx_lidar.ros2_topic` (default: `/IsaacSim/rtx_lidar/point_cloud`)
   - `sensors.rtx_lidar.ros2_frame_id` (default: `rtx_lidar_link`)
 - **IMU** (sensor_msgs/Imu): `sensors.imu.ros2_topic` (default: `/IsaacSim/imu`)
-- **DVL** (nav_msgs/Odometry): `sensors.dvl.ros2_topic` (default: `/IsaacSim/dvl/odom`)
+- **DVL** (`geometry_msgs/TwistWithCovarianceStamped`): `sensors.dvl.ros2_topic` (default: `/auv/dvl`)
   - The DVL comes from **OceanSim**.
 
 ### 2D imaging sonar
