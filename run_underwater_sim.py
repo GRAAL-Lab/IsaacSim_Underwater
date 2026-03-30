@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -503,8 +504,10 @@ def main() -> None:
     # Simulation timing.
     physics_hz = float(sim_cfg["timing"]["physics_hz"])
     render_fps = float(sim_cfg["timing"]["render_fps"])
+    realtime = bool(sim_cfg["timing"].get("realtime", False))
     if physics_hz <= 0.0 or render_fps <= 0.0:
         raise ValueError("simulation.timing.physics_hz and render_fps must be > 0")
+    render_every = max(1, int(round(physics_hz / render_fps)))
 
     world = World(
         stage_units_in_meters=1.0,
@@ -625,6 +628,8 @@ def main() -> None:
 
     imaging_sonar = None
     imaging_sonar_cfg = sensors_cfg.get("imaging_sonar", {})
+    imaging_sonar_every = 1
+    imaging_sonar_tick = 0
     if bool(imaging_sonar_cfg.get("enabled", False)):
         imaging_sonar = ImagingSonarSensor(
             prim_path=str(imaging_sonar_cfg["prim_path"]),
@@ -661,6 +666,8 @@ def main() -> None:
             stream_height=imaging_sonar_stream_height,
             graph_path="/ROS2ImagingSonarGraph",
         )
+        sonar_freq = max(float(imaging_sonar_cfg.get("frequency_hz", 0.0)), 1e-6)
+        imaging_sonar_every = max(1, int(round(physics_hz / sonar_freq)))
 
     def _render_imaging_sonar_frame() -> bool:
         if imaging_sonar is None:
@@ -869,6 +876,29 @@ def main() -> None:
     simulation_app.update()
     base_tf_translation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:translation")
     base_tf_rotation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:rotation")
+
+    # Publish /clock for ROS2 time synchronization.
+    clock_graph_path = "/ROS2ClockGraph"
+    og.Controller.edit(
+        {"graph_path": clock_graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
+            ],
+            keys.SET_VALUES: [
+                ("PublishClock.inputs:topicName", "/clock"),
+                ("PublishClock.inputs:nodeNamespace", ros_namespace),
+                ("PublishClock.inputs:queueSize", queue_size),
+            ],
+            keys.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+            ],
+        },
+    )
+    simulation_app.update()
 
     velocity_graph_path = "/ROS2VelocityGraph"
     og.Controller.edit(
@@ -1151,185 +1181,198 @@ def main() -> None:
             is_global=True,
         )
 
+    callback_counter = 0
+
+    render_this_step_flag = False
+
     def _on_physics_step(_step_size: float) -> None:
-        nonlocal baro_last_pub_time
-        state = _read_state()
-        if state is None:
-            return
-        pos, q, lin_world, ang_world = state
-        if pose_pub_node is not None:
-            sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
-            sec = int(sim_time)
-            nanosec = int((sim_time - sec) * 1e9)
-            quat_xyzw = [float(q[1]), float(q[2]), float(q[3]), float(q[0])]
-            if pose_attr_header is not None:
-                pose_attr_header.set(
-                    json.dumps(
-                        {
-                            "frame_id": pose_frame_id,
-                            "stamp": {"sec": sec, "nanosec": nanosec},
-                        }
-                    )
-                )
-            if pose_attr_frame_id is not None:
-                pose_attr_frame_id.set(pose_frame_id)
-            if pose_attr_stamp_sec is not None:
-                pose_attr_stamp_sec.set(sec)
-            if pose_attr_stamp_nsec is not None:
-                pose_attr_stamp_nsec.set(nanosec)
-            if pose_attr_pose is not None:
-                pose_attr_pose.set(
-                    json.dumps(
-                        {
-                            "position": {"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])},
-                            "orientation": {
-                                "x": quat_xyzw[0],
-                                "y": quat_xyzw[1],
-                                "z": quat_xyzw[2],
-                                "w": quat_xyzw[3],
-                            },
-                        }
-                    )
-                )
-            if pose_attr_pos is not None:
-                pose_attr_pos.set([float(pos[0]), float(pos[1]), float(pos[2])])
-            else:
-                if pose_attr_pos_x is not None:
-                    pose_attr_pos_x.set(float(pos[0]))
-                if pose_attr_pos_y is not None:
-                    pose_attr_pos_y.set(float(pos[1]))
-                if pose_attr_pos_z is not None:
-                    pose_attr_pos_z.set(float(pos[2]))
-            if pose_attr_ori is not None:
-                pose_attr_ori.set(quat_xyzw)
-            else:
-                if pose_attr_ori_x is not None:
-                    pose_attr_ori_x.set(quat_xyzw[0])
-                if pose_attr_ori_y is not None:
-                    pose_attr_ori_y.set(quat_xyzw[1])
-                if pose_attr_ori_z is not None:
-                    pose_attr_ori_z.set(quat_xyzw[2])
-                if pose_attr_ori_w is not None:
-                    pose_attr_ori_w.set(quat_xyzw[3])
-        if base_tf_translation_attr is not None:
-            base_tf_translation_attr.set([float(pos[0]), float(pos[1]), float(pos[2])])
-        if base_tf_rotation_attr is not None:
-            base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
-        if baro_enabled and baro_pub_node is not None:
-            sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
-            if baro_period <= 0.0 or baro_last_pub_time < 0.0 or (sim_time - baro_last_pub_time) >= baro_period:
-                baro_last_pub_time = sim_time
+        nonlocal baro_last_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag
+        start_time = time.perf_counter()
+        try:
+            state = _read_state()
+            if state is None:
+                return
+            pos, q, lin_world, ang_world = state
+            if pose_pub_node is not None:
+                sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
                 sec = int(sim_time)
                 nanosec = int((sim_time - sec) * 1e9)
-                surface_z = float(baro_cfg.get("surface_z", 0.0))
-                depth = max(0.0, surface_z - float(pos[2]))
-                fluid_density = float(baro_cfg.get("fluid_density", 1025.0))
-                gravity = float(baro_cfg.get("gravity", 9.80665))
-                surface_pressure = float(baro_cfg.get("surface_pressure", 101325.0))
-                pressure = surface_pressure + fluid_density * gravity * depth
-                variance = float(baro_cfg.get("variance", 0.0))
-                if baro_attr_header is not None:
-                    baro_attr_header.set(
+                quat_xyzw = [float(q[1]), float(q[2]), float(q[3]), float(q[0])]
+                if pose_attr_header is not None:
+                    pose_attr_header.set(
                         json.dumps(
                             {
-                                "frame_id": str(baro_cfg["ros2_frame_id"]),
+                                "frame_id": pose_frame_id,
                                 "stamp": {"sec": sec, "nanosec": nanosec},
                             }
                         )
                     )
-                if baro_attr_frame_id is not None:
-                    baro_attr_frame_id.set(str(baro_cfg["ros2_frame_id"]))
-                if baro_attr_stamp_sec is not None:
-                    baro_attr_stamp_sec.set(sec)
-                if baro_attr_stamp_nsec is not None:
-                    baro_attr_stamp_nsec.set(nanosec)
-                if baro_attr_pressure is not None:
-                    baro_attr_pressure.set(float(pressure))
-                if baro_attr_variance is not None:
-                    baro_attr_variance.set(float(variance))
-        pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
-            pos, q, lin_world, ang_world
-        )
-        if velocity_attr_twist is not None:
-            velocity_attr_twist.set(
-                json.dumps(
-                    {
-                        "linear": {
-                            "x": float(v_body[0]),
-                            "y": float(v_body[1]),
-                            "z": float(v_body[2]),
-                        },
-                        "angular": {
-                            "x": float(v_body[3]),
-                            "y": float(v_body[4]),
-                            "z": float(v_body[5]),
-                        },
-                    }
-                )
+                if pose_attr_frame_id is not None:
+                    pose_attr_frame_id.set(pose_frame_id)
+                if pose_attr_stamp_sec is not None:
+                    pose_attr_stamp_sec.set(sec)
+                if pose_attr_stamp_nsec is not None:
+                    pose_attr_stamp_nsec.set(nanosec)
+                if pose_attr_pose is not None:
+                    pose_attr_pose.set(
+                        json.dumps(
+                            {
+                                "position": {"x": float(pos[0]), "y": float(pos[1]), "z": float(pos[2])},
+                                "orientation": {
+                                    "x": quat_xyzw[0],
+                                    "y": quat_xyzw[1],
+                                    "z": quat_xyzw[2],
+                                    "w": quat_xyzw[3],
+                                },
+                            }
+                        )
+                    )
+                if pose_attr_pos is not None:
+                    pose_attr_pos.set([float(pos[0]), float(pos[1]), float(pos[2])])
+                else:
+                    if pose_attr_pos_x is not None:
+                        pose_attr_pos_x.set(float(pos[0]))
+                    if pose_attr_pos_y is not None:
+                        pose_attr_pos_y.set(float(pos[1]))
+                    if pose_attr_pos_z is not None:
+                        pose_attr_pos_z.set(float(pos[2]))
+                if pose_attr_ori is not None:
+                    pose_attr_ori.set(quat_xyzw)
+                else:
+                    if pose_attr_ori_x is not None:
+                        pose_attr_ori_x.set(quat_xyzw[0])
+                    if pose_attr_ori_y is not None:
+                        pose_attr_ori_y.set(quat_xyzw[1])
+                    if pose_attr_ori_z is not None:
+                        pose_attr_ori_z.set(quat_xyzw[2])
+                    if pose_attr_ori_w is not None:
+                        pose_attr_ori_w.set(quat_xyzw[3])
+            if render_this_step_flag:
+                if base_tf_translation_attr is not None:
+                    base_tf_translation_attr.set([float(pos[0]), float(pos[1]), float(pos[2])])
+                if base_tf_rotation_attr is not None:
+                    base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+            if baro_enabled and baro_pub_node is not None:
+                sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
+                if baro_period <= 0.0 or baro_last_pub_time < 0.0 or (sim_time - baro_last_pub_time) >= baro_period:
+                    baro_last_pub_time = sim_time
+                    sec = int(sim_time)
+                    nanosec = int((sim_time - sec) * 1e9)
+                    surface_z = float(baro_cfg.get("surface_z", 0.0))
+                    depth = max(0.0, surface_z - float(pos[2]))
+                    fluid_density = float(baro_cfg.get("fluid_density", 1025.0))
+                    gravity = float(baro_cfg.get("gravity", 9.80665))
+                    surface_pressure = float(baro_cfg.get("surface_pressure", 101325.0))
+                    pressure = surface_pressure + fluid_density * gravity * depth
+                    variance = float(baro_cfg.get("variance", 0.0))
+                    if baro_attr_header is not None:
+                        baro_attr_header.set(
+                            json.dumps(
+                                {
+                                    "frame_id": str(baro_cfg["ros2_frame_id"]),
+                                    "stamp": {"sec": sec, "nanosec": nanosec},
+                                }
+                            )
+                        )
+                    if baro_attr_frame_id is not None:
+                        baro_attr_frame_id.set(str(baro_cfg["ros2_frame_id"]))
+                    if baro_attr_stamp_sec is not None:
+                        baro_attr_stamp_sec.set(sec)
+                    if baro_attr_stamp_nsec is not None:
+                        baro_attr_stamp_nsec.set(nanosec)
+                    if baro_attr_pressure is not None:
+                        baro_attr_pressure.set(float(pressure))
+                    if baro_attr_variance is not None:
+                        baro_attr_variance.set(float(variance))
+            pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
+                pos, q, lin_world, ang_world
             )
-        else:
-            if velocity_attr_linear is not None:
-                velocity_attr_linear.set([float(v_body[0]), float(v_body[1]), float(v_body[2])])
-            else:
-                if velocity_attr_linear_x is not None:
-                    velocity_attr_linear_x.set(float(v_body[0]))
-                if velocity_attr_linear_y is not None:
-                    velocity_attr_linear_y.set(float(v_body[1]))
-                if velocity_attr_linear_z is not None:
-                    velocity_attr_linear_z.set(float(v_body[2]))
-            if velocity_attr_angular is not None:
-                velocity_attr_angular.set([float(v_body[3]), float(v_body[4]), float(v_body[5])])
-            else:
-                if velocity_attr_angular_x is not None:
-                    velocity_attr_angular_x.set(float(v_body[3]))
-                if velocity_attr_angular_y is not None:
-                    velocity_attr_angular_y.set(float(v_body[4]))
-                if velocity_attr_angular_z is not None:
-                    velocity_attr_angular_z.set(float(v_body[5]))
-        if acceleration_attr_twist is not None:
-            acceleration_attr_twist.set(
-                json.dumps(
-                    {
-                        "linear": {
-                            "x": float(lin_accel_body[0]),
-                            "y": float(lin_accel_body[1]),
-                            "z": float(lin_accel_body[2]),
-                        },
-                        "angular": {
-                            "x": float(ang_accel_body[0]),
-                            "y": float(ang_accel_body[1]),
-                            "z": float(ang_accel_body[2]),
-                        },
-                    }
-                )
-            )
-        else:
-            if acceleration_attr_linear is not None:
-                acceleration_attr_linear.set(
-                    [float(lin_accel_body[0]), float(lin_accel_body[1]), float(lin_accel_body[2])]
+            if velocity_attr_twist is not None:
+                velocity_attr_twist.set(
+                    json.dumps(
+                        {
+                            "linear": {
+                                "x": float(v_body[0]),
+                                "y": float(v_body[1]),
+                                "z": float(v_body[2]),
+                            },
+                            "angular": {
+                                "x": float(v_body[3]),
+                                "y": float(v_body[4]),
+                                "z": float(v_body[5]),
+                            },
+                        }
+                    )
                 )
             else:
-                if acceleration_attr_linear_x is not None:
-                    acceleration_attr_linear_x.set(float(lin_accel_body[0]))
-                if acceleration_attr_linear_y is not None:
-                    acceleration_attr_linear_y.set(float(lin_accel_body[1]))
-                if acceleration_attr_linear_z is not None:
-                    acceleration_attr_linear_z.set(float(lin_accel_body[2]))
-            if acceleration_attr_angular is not None:
-                acceleration_attr_angular.set(
-                    [float(ang_accel_body[0]), float(ang_accel_body[1]), float(ang_accel_body[2])]
+                if velocity_attr_linear is not None:
+                    velocity_attr_linear.set([float(v_body[0]), float(v_body[1]), float(v_body[2])])
+                else:
+                    if velocity_attr_linear_x is not None:
+                        velocity_attr_linear_x.set(float(v_body[0]))
+                    if velocity_attr_linear_y is not None:
+                        velocity_attr_linear_y.set(float(v_body[1]))
+                    if velocity_attr_linear_z is not None:
+                        velocity_attr_linear_z.set(float(v_body[2]))
+                if velocity_attr_angular is not None:
+                    velocity_attr_angular.set([float(v_body[3]), float(v_body[4]), float(v_body[5])])
+                else:
+                    if velocity_attr_angular_x is not None:
+                        velocity_attr_angular_x.set(float(v_body[3]))
+                    if velocity_attr_angular_y is not None:
+                        velocity_attr_angular_y.set(float(v_body[4]))
+                    if velocity_attr_angular_z is not None:
+                        velocity_attr_angular_z.set(float(v_body[5]))
+            if acceleration_attr_twist is not None:
+                acceleration_attr_twist.set(
+                    json.dumps(
+                        {
+                            "linear": {
+                                "x": float(lin_accel_body[0]),
+                                "y": float(lin_accel_body[1]),
+                                "z": float(lin_accel_body[2]),
+                            },
+                            "angular": {
+                                "x": float(ang_accel_body[0]),
+                                "y": float(ang_accel_body[1]),
+                                "z": float(ang_accel_body[2]),
+                            },
+                        }
+                    )
                 )
             else:
-                if acceleration_attr_angular_x is not None:
-                    acceleration_attr_angular_x.set(float(ang_accel_body[0]))
-                if acceleration_attr_angular_y is not None:
-                    acceleration_attr_angular_y.set(float(ang_accel_body[1]))
-                if acceleration_attr_angular_z is not None:
-                    acceleration_attr_angular_z.set(float(ang_accel_body[2]))
-        forces = _select_forces()
-        tau_total = _compute_tau(v_body, pose_vec, forces)
-        _apply_wrench(R, tau_total)
-        _render_imaging_sonar_frame()
+                if acceleration_attr_linear is not None:
+                    acceleration_attr_linear.set(
+                        [float(lin_accel_body[0]), float(lin_accel_body[1]), float(lin_accel_body[2])]
+                    )
+                else:
+                    if acceleration_attr_linear_x is not None:
+                        acceleration_attr_linear_x.set(float(lin_accel_body[0]))
+                    if acceleration_attr_linear_y is not None:
+                        acceleration_attr_linear_y.set(float(lin_accel_body[1]))
+                    if acceleration_attr_linear_z is not None:
+                        acceleration_attr_linear_z.set(float(lin_accel_body[2]))
+                if acceleration_attr_angular is not None:
+                    acceleration_attr_angular.set(
+                        [float(ang_accel_body[0]), float(ang_accel_body[1]), float(ang_accel_body[2])]
+                    )
+                else:
+                    if acceleration_attr_angular_x is not None:
+                        acceleration_attr_angular_x.set(float(ang_accel_body[0]))
+                    if acceleration_attr_angular_y is not None:
+                        acceleration_attr_angular_y.set(float(ang_accel_body[1]))
+                    if acceleration_attr_angular_z is not None:
+                        acceleration_attr_angular_z.set(float(ang_accel_body[2]))
+            forces = _select_forces()
+            tau_total = _compute_tau(v_body, pose_vec, forces)
+            _apply_wrench(R, tau_total)
+            if imaging_sonar is not None:
+                if render_this_step_flag and (imaging_sonar_tick % imaging_sonar_every) == 0:
+                    _render_imaging_sonar_frame()
+                imaging_sonar_tick += 1
+        finally:
+            callback_counter += 1
+            pass
 
     simulation_app.update()
     world.reset()
@@ -1345,13 +1388,37 @@ def main() -> None:
     try:
         main_loop_frame = 0
         while simulation_app.is_running():
-            world.step(render=True)
-            if uw_camera is not None:
-                uw_camera.step_processed()
+            loop_start = time.perf_counter()
+            render_this_step = (main_loop_frame % render_every) == 0
+            render_this_step_flag = render_this_step
+            step_start = time.perf_counter()
+            world.step(render=render_this_step)
+            step_ms = (time.perf_counter() - step_start) * 1000.0
 
+            camera_ms = 0.0
+            if uw_camera is not None and render_this_step:
+                cam_start = time.perf_counter()
+                uw_camera.step_processed()
+                camera_ms = (time.perf_counter() - cam_start) * 1000.0
+
+            dvl_ms = 0.0
+            dvl_start = time.perf_counter()
             velocity = dvl_sensor.get_linear_vel_fd(physics_dt=1.0 / physics_hz)
             if isinstance(velocity, np.ndarray) and velocity.shape[0] >= 3:
                 dvl_linear_vel_attr.set([float(velocity[0]), float(velocity[1]), float(velocity[2])])
+            dvl_ms = (time.perf_counter() - dvl_start) * 1000.0
+
+            loop_ms = (time.perf_counter() - loop_start) * 1000.0
+            if realtime:
+                target_ms = 1000.0 / physics_hz
+                sleep_ms = target_ms - loop_ms
+                if sleep_ms > 0.0:
+                    time.sleep(sleep_ms / 1000.0)
+                    loop_ms = (time.perf_counter() - loop_start) * 1000.0
+            print(
+                f"[main_loop] frame {main_loop_frame} total {loop_ms:.3f} ms | "
+                f"world.step {step_ms:.3f} ms | uw_camera {camera_ms:.3f} ms | dvl {dvl_ms:.3f} ms"
+            )
             main_loop_frame += 1
     finally:
         world.remove_physics_callback("mvm_dynamics")

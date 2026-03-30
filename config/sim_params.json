@@ -1,13 +1,14 @@
 {
   "simulation": {
     "app": {
-      "headless": false,
-      "disable_viewport_updates": false,
+      "headless": true  ,
+      "disable_viewport_updates": true,
       "enable_motion_bvh": true
     },
     "timing": {
       "physics_hz": 120.0,
-      "render_fps": 30.0
+      "render_fps": 30.0,
+      "realtime": true
     }
   },
   "map": {
@@ -125,9 +126,9 @@
         15.0,
         0.0
       ],
-      "ros2_topic": "/IsaacSim/rtx_lidar/point_cloud",
+      "ros2_topic": "/sonar_point_cloud",
       "ros2_frame_id": "three_d_sonar_link",
-      "frame_skip_count": 0,
+      "frame_skip_count": 1,
       "show_debug_view": false
     },
     "dvl": {
@@ -145,7 +146,7 @@
         0.0
       ],
       "frequency_hz": 10,
-      "ros2_topic": "/IsaacSim/dvl/odom",
+      "ros2_topic": "/auv/dvl",
       "ros2_frame_id": "dvl_link",
       "elevation_deg": 22.5,
       "rotation_deg": 45.0,
@@ -170,7 +171,7 @@
         0.0
       ],
       "frequency_hz": 100,
-      "ros2_topic": "/IsaacSim/imu",
+      "ros2_topic": "/auv/imu/data_raw",
       "ros2_frame_id": "imu_link"
     },
     "barometer": {
@@ -186,7 +187,7 @@
         0.0
       ],
       "frequency_hz": 100.0,
-      "ros2_topic": "/IsaacSim/barometer",
+      "ros2_topic": "/auv/pressure/scaled2",
       "ros2_frame_id": "barometer_link",
       "surface_z": 0.0,
       "fluid_density": 1025.0,

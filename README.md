@@ -110,9 +110,14 @@ export MVM_ROOT="$PWD"
 
 Then build the underwater vehicle model bindings against Isaac Sim Python 3.11:
 ```bash
+export ISAACSIM_ROOT=/path/to/isaac-sim-5.1
+test -x "$ISAACSIM_ROOT/kit/python/bin/python3"
+"$ISAACSIM_ROOT/kit/python/bin/python3" --version
+
 cd "$MVM_ROOT/underwater_vehicle_model"
 
 # Build directory dedicated to Isaac Sim Python 3.11
+rm -rf build_isaac_py311
 mkdir -p build_isaac_py311
 cd build_isaac_py311
 
@@ -120,14 +125,31 @@ cmake .. \
   -DBUILD_PYTHON_BINDINGS=ON \
   -DPython_EXECUTABLE="$ISAACSIM_ROOT/kit/python/bin/python3"
 
-make -j
+make -j"$(nproc)"
 ```
 
-After building, you should have:
-- `mvm_py.cpython-311-x86_64-linux-gnu.so`
-- `libunderwater_vehicle_model.so`
+> Important:
+> - Use `Python_EXECUTABLE`, not `Python3_EXECUTABLE`.
+> - In this project, `Python3_EXECUTABLE` is ignored by CMake.
+> - If CMake still picks your system Python, retry with:
+>
+> ```bash
+> cmake .. \
+>   -DBUILD_PYTHON_BINDINGS=ON \
+>   -DPython_ROOT_DIR="$ISAACSIM_ROOT/kit/python"
+> ```
 
-in the same build folder.
+After building, verify that the module was compiled against Isaac Sim Python 3.11:
+```bash
+find . -maxdepth 1 -name "*.so" | sort
+
+You should see:
+
+libunderwater_vehicle_model.so
+mvm_py.cpython-311-x86_64-linux-gnu.so
+
+If you see mvm_py.cpython-312-...so or another non-3.11 suffix, CMake picked your system Python instead of Isaac Sim Python. In that case, delete the build folder and reconfigure using -DPython_EXECUTABLE="$ISAACSIM_ROOT/kit/python/bin/python3" or -DPython_ROOT_DIR="$ISAACSIM_ROOT/kit/python".
+```
 
 ### Export for the simulation
 Point `MVM_PY_PATH` to the folder that contains the built `mvm_py*.so`:
@@ -138,6 +160,19 @@ export MVM_PY_PATH="$MVM_ROOT/underwater_vehicle_model/build_isaac_py311"
 > Tip: keep the module and `libunderwater_vehicle_model.so` together (as produced by the build). If you move the build folder, you may need to rebuild or adjust your library search path.
 
 In this repository’s default setup, you typically do **not** need to set `LD_LIBRARY_PATH` as long as `mvm_py*.so` and `libunderwater_vehicle_model.so` stay in the same build directory.
+
+You can also test the module import directly with Isaac Sim Python:
+```bash
+export MVM_PY_PATH="$MVM_ROOT/underwater_vehicle_model/build_isaac_py311"
+export LD_LIBRARY_PATH="$MVM_PY_PATH:${LD_LIBRARY_PATH:-}"
+
+"$ISAACSIM_ROOT/kit/python/bin/python3" -c "
+import sys
+sys.path.insert(0, '$MVM_PY_PATH')
+import mvm_py
+print('mvm_py import OK:', mvm_py)
+"
+```
 
 ---
 
