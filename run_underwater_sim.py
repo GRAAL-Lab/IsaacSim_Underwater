@@ -727,8 +727,6 @@ def main() -> None:
     simulation_app.update()
     pose_pub_node = og.Controller.node(f"{pose_graph_path}/PublishPose")
     pose_pub_attrs = {attr.get_name(): attr for attr in pose_pub_node.get_attributes()}
-    pose_time_attr = og.Controller.attribute(f"{pose_graph_path}/ReadSimTime.outputs:simulationTime")
-
     def _find_attr(*names: str):
         for name in names:
             if name in pose_pub_attrs:
@@ -1124,8 +1122,6 @@ def main() -> None:
     simulation_app.update()
     dvl_pub_node = og.Controller.node(f"{dvl_graph_path}/PublishDVL")
     dvl_pub_attrs = {attr.get_name(): attr for attr in dvl_pub_node.get_attributes()}
-    dvl_time_attr = og.Controller.attribute(f"{dvl_graph_path}/ReadSimTime.outputs:simulationTime")
-
     def _dvl_find_attr(*names: str):
         for name in names:
             if name in dvl_pub_attrs:
@@ -1216,21 +1212,26 @@ def main() -> None:
         )
 
     callback_counter = 0
+    sim_time_seconds = 0.0
 
     render_this_step_flag = False
 
     def _on_physics_step(_step_size: float) -> None:
-        nonlocal baro_last_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag
+        nonlocal baro_last_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag, sim_time_seconds
         start_time = time.perf_counter()
         try:
+            sim_time_seconds += float(_step_size)
             state = _read_state()
             if state is None:
                 return
             pos, q, lin_world, ang_world = state
             if pose_pub_node is not None:
-                sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
+                sim_time = sim_time_seconds
                 sec = int(sim_time)
-                nanosec = int((sim_time - sec) * 1e9)
+                nanosec = int(round((sim_time - sec) * 1e9))
+                if nanosec >= 1_000_000_000:
+                    sec += 1
+                    nanosec -= 1_000_000_000
                 quat_xyzw = [float(q[1]), float(q[2]), float(q[3]), float(q[0])]
                 if pose_attr_header is not None:
                     pose_attr_header.set(
@@ -1287,11 +1288,14 @@ def main() -> None:
                 if base_tf_rotation_attr is not None:
                     base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
             if baro_enabled and baro_pub_node is not None:
-                sim_time = float(pose_time_attr.get()) if pose_time_attr is not None else 0.0
+                sim_time = sim_time_seconds
                 if baro_period <= 0.0 or baro_last_pub_time < 0.0 or (sim_time - baro_last_pub_time) >= baro_period:
                     baro_last_pub_time = sim_time
                     sec = int(sim_time)
-                    nanosec = int((sim_time - sec) * 1e9)
+                    nanosec = int(round((sim_time - sec) * 1e9))
+                    if nanosec >= 1_000_000_000:
+                        sec += 1
+                        nanosec -= 1_000_000_000
                     surface_z = float(baro_cfg.get("surface_z", 0.0))
                     depth = max(0.0, surface_z - float(pos[2]))
                     fluid_density = float(baro_cfg.get("fluid_density", 1025.0))
@@ -1441,9 +1445,12 @@ def main() -> None:
             if isinstance(velocity, np.ndarray) and velocity.shape[0] >= 3:
                 dvl_velocity = [float(velocity[0]), float(velocity[1]), float(velocity[2])]
                 dvl_angular_velocity = [0.0, 0.0, 0.0]
-                sim_time = float(dvl_time_attr.get()) if dvl_time_attr is not None else 0.0
+                sim_time = sim_time_seconds
                 sec = int(sim_time)
-                nanosec = int((sim_time - sec) * 1e9)
+                nanosec = int(round((sim_time - sec) * 1e9))
+                if nanosec >= 1_000_000_000:
+                    sec += 1
+                    nanosec -= 1_000_000_000
 
                 if dvl_attr_header is not None:
                     dvl_attr_header.set(
