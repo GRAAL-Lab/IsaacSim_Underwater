@@ -145,7 +145,7 @@
         0.0,
         0.0
       ],
-      "frequency_hz": 10,
+      "frequency_hz": 8,
       "ros2_topic": "/auv/dvl",
       "ros2_frame_id": "dvl_link",
       "elevation_deg": 22.5,
@@ -154,6 +154,8 @@
       "max_range_m": 100.0,
       "vel_cov": 0.0,
       "depth_cov": 0.0,
+      "beam_dropout_threshold": 2,
+      "require_bottom_lock": true,
       "debug_lines": false
     },
     "imu": {

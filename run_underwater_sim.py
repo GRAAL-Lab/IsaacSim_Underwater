@@ -1093,19 +1093,18 @@ def main() -> None:
     )
 
     dvl_frequency_hz = float(dvl_cfg["frequency_hz"])
-    dvl_publish_step = max(1, int(round(physics_hz / dvl_frequency_hz))) if dvl_frequency_hz > 0.0 else 1
+    dvl_require_bottom_lock = bool(dvl_cfg.get("require_bottom_lock", True))
+    dvl_beam_dropout_threshold = int(dvl_cfg.get("beam_dropout_threshold", 2))
     dvl_graph_path = "/ROS2DVLGraph"
     og.Controller.edit(
         {"graph_path": dvl_graph_path, "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("DVLPublishGate", "isaacsim.core.nodes.IsaacSimulationGate"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("DVLPublishImpulse", "omni.graph.action.OnImpulseEvent"),
+                ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
                 ("PublishDVL", "isaacsim.ros2.bridge.ROS2Publisher"),
             ],
             keys.SET_VALUES: [
-                ("DVLPublishGate.inputs:step", dvl_publish_step),
                 ("PublishDVL.inputs:topicName", str(dvl_cfg["ros2_topic"])),
                 ("PublishDVL.inputs:messagePackage", "geometry_msgs"),
                 ("PublishDVL.inputs:messageSubfolder", "msg"),
@@ -1114,13 +1113,14 @@ def main() -> None:
                 ("PublishDVL.inputs:queueSize", queue_size),
             ],
             keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "DVLPublishGate.inputs:execIn"),
-                ("DVLPublishGate.outputs:execOut", "PublishDVL.inputs:execIn"),
+                ("DVLPublishImpulse.outputs:execOut", "PublishDVL.inputs:execIn"),
+                ("ROS2Context.outputs:context", "PublishDVL.inputs:context"),
             ],
         },
     )
     simulation_app.update()
     dvl_pub_node = og.Controller.node(f"{dvl_graph_path}/PublishDVL")
+    dvl_publish_impulse_attr = og.Controller.attribute(f"{dvl_graph_path}/DVLPublishImpulse.state:enableImpulse")
     dvl_pub_attrs = {attr.get_name(): attr for attr in dvl_pub_node.get_attributes()}
     def _dvl_find_attr(*names: str):
         for name in names:
@@ -1147,6 +1147,13 @@ def main() -> None:
     dvl_linear_cov = float(dvl_cfg.get("vel_cov", 0.0))
     for diagonal_idx in (0, 7, 14):
         dvl_twist_covariance[diagonal_idx] = dvl_linear_cov
+    def _split_ros_time(sim_time: float) -> tuple[int, int]:
+        sec = int(sim_time)
+        nanosec = int(round((sim_time - sec) * 1e9))
+        if nanosec >= 1_000_000_000:
+            sec += 1
+            nanosec -= 1_000_000_000
+        return sec, nanosec
 
     prev_lin_world = np.zeros(3, dtype=float)
     prev_ang_world = np.zeros(3, dtype=float)
@@ -1322,6 +1329,92 @@ def main() -> None:
                         baro_attr_pressure.set(float(pressure))
                     if baro_attr_variance is not None:
                         baro_attr_variance.set(float(variance))
+            dvl_velocity_sample = dvl_sensor.get_linear_vel_fd(physics_dt=1.0 / physics_hz)
+            if isinstance(dvl_velocity_sample, np.ndarray) and dvl_velocity_sample.shape[0] >= 3:
+                beam_hits = None
+                if dvl_require_bottom_lock:
+                    try:
+                        beam_hits = [bool(hit) for hit in dvl_sensor.get_beam_hit()]
+                    except Exception:
+                        beam_hits = None
+                if (not dvl_require_bottom_lock) or (
+                    beam_hits is not None and beam_hits.count(False) < dvl_beam_dropout_threshold
+                ):
+                    sim_time = sim_time_seconds
+                    sec, nanosec = _split_ros_time(sim_time)
+                    dvl_velocity = [
+                        float(dvl_velocity_sample[0]),
+                        float(dvl_velocity_sample[1]),
+                        float(dvl_velocity_sample[2]),
+                    ]
+                    dvl_angular_velocity = [0.0, 0.0, 0.0]
+                    if dvl_attr_header is not None:
+                        dvl_attr_header.set(
+                            json.dumps(
+                                {
+                                    "frame_id": str(dvl_cfg["ros2_frame_id"]),
+                                    "stamp": {"sec": sec, "nanosec": nanosec},
+                                }
+                            )
+                        )
+                    if dvl_attr_frame_id is not None:
+                        dvl_attr_frame_id.set(str(dvl_cfg["ros2_frame_id"]))
+                    if dvl_attr_stamp_sec is not None:
+                        dvl_attr_stamp_sec.set(sec)
+                    if dvl_attr_stamp_nsec is not None:
+                        dvl_attr_stamp_nsec.set(nanosec)
+                    if dvl_attr_twist_with_cov is not None:
+                        dvl_attr_twist_with_cov.set(
+                            json.dumps(
+                                {
+                                    "twist": {
+                                        "linear": {
+                                            "x": dvl_velocity[0],
+                                            "y": dvl_velocity[1],
+                                            "z": dvl_velocity[2],
+                                        },
+                                        "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+                                    },
+                                    "covariance": dvl_twist_covariance,
+                                }
+                            )
+                        )
+                    else:
+                        if dvl_attr_twist is not None:
+                            dvl_attr_twist.set(
+                                json.dumps(
+                                    {
+                                        "linear": {
+                                            "x": dvl_velocity[0],
+                                            "y": dvl_velocity[1],
+                                            "z": dvl_velocity[2],
+                                        },
+                                        "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+                                    }
+                                )
+                            )
+                        if dvl_attr_linear is not None:
+                            dvl_attr_linear.set(dvl_velocity)
+                        else:
+                            if dvl_attr_linear_x is not None:
+                                dvl_attr_linear_x.set(dvl_velocity[0])
+                            if dvl_attr_linear_y is not None:
+                                dvl_attr_linear_y.set(dvl_velocity[1])
+                            if dvl_attr_linear_z is not None:
+                                dvl_attr_linear_z.set(dvl_velocity[2])
+                        if dvl_attr_angular is not None:
+                            dvl_attr_angular.set(dvl_angular_velocity)
+                        else:
+                            if dvl_attr_angular_x is not None:
+                                dvl_attr_angular_x.set(0.0)
+                            if dvl_attr_angular_y is not None:
+                                dvl_attr_angular_y.set(0.0)
+                            if dvl_attr_angular_z is not None:
+                                dvl_attr_angular_z.set(0.0)
+                        if dvl_attr_covariance is not None:
+                            dvl_attr_covariance.set(dvl_twist_covariance)
+                    if dvl_publish_impulse_attr is not None:
+                        dvl_publish_impulse_attr.set(True)
             pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
                 pos, q, lin_world, ang_world
             )
@@ -1438,86 +1531,6 @@ def main() -> None:
                 cam_start = time.perf_counter()
                 uw_camera.step_processed()
                 camera_ms = (time.perf_counter() - cam_start) * 1000.0
-
-            dvl_ms = 0.0
-            dvl_start = time.perf_counter()
-            velocity = dvl_sensor.get_linear_vel_fd(physics_dt=1.0 / physics_hz)
-            if isinstance(velocity, np.ndarray) and velocity.shape[0] >= 3:
-                dvl_velocity = [float(velocity[0]), float(velocity[1]), float(velocity[2])]
-                dvl_angular_velocity = [0.0, 0.0, 0.0]
-                sim_time = sim_time_seconds
-                sec = int(sim_time)
-                nanosec = int(round((sim_time - sec) * 1e9))
-                if nanosec >= 1_000_000_000:
-                    sec += 1
-                    nanosec -= 1_000_000_000
-
-                if dvl_attr_header is not None:
-                    dvl_attr_header.set(
-                        json.dumps(
-                            {
-                                "frame_id": str(dvl_cfg["ros2_frame_id"]),
-                                "stamp": {"sec": sec, "nanosec": nanosec},
-                            }
-                        )
-                    )
-                if dvl_attr_frame_id is not None:
-                    dvl_attr_frame_id.set(str(dvl_cfg["ros2_frame_id"]))
-                if dvl_attr_stamp_sec is not None:
-                    dvl_attr_stamp_sec.set(sec)
-                if dvl_attr_stamp_nsec is not None:
-                    dvl_attr_stamp_nsec.set(nanosec)
-                if dvl_attr_twist_with_cov is not None:
-                    dvl_attr_twist_with_cov.set(
-                        json.dumps(
-                            {
-                                "twist": {
-                                    "linear": {
-                                        "x": dvl_velocity[0],
-                                        "y": dvl_velocity[1],
-                                        "z": dvl_velocity[2],
-                                    },
-                                    "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
-                                },
-                                "covariance": dvl_twist_covariance,
-                            }
-                        )
-                    )
-                else:
-                    if dvl_attr_twist is not None:
-                        dvl_attr_twist.set(
-                            json.dumps(
-                                {
-                                    "linear": {
-                                        "x": dvl_velocity[0],
-                                        "y": dvl_velocity[1],
-                                        "z": dvl_velocity[2],
-                                    },
-                                    "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
-                                }
-                            )
-                        )
-                    if dvl_attr_linear is not None:
-                        dvl_attr_linear.set(dvl_velocity)
-                    else:
-                        if dvl_attr_linear_x is not None:
-                            dvl_attr_linear_x.set(dvl_velocity[0])
-                        if dvl_attr_linear_y is not None:
-                            dvl_attr_linear_y.set(dvl_velocity[1])
-                        if dvl_attr_linear_z is not None:
-                            dvl_attr_linear_z.set(dvl_velocity[2])
-                    if dvl_attr_angular is not None:
-                        dvl_attr_angular.set(dvl_angular_velocity)
-                    else:
-                        if dvl_attr_angular_x is not None:
-                            dvl_attr_angular_x.set(0.0)
-                        if dvl_attr_angular_y is not None:
-                            dvl_attr_angular_y.set(0.0)
-                        if dvl_attr_angular_z is not None:
-                            dvl_attr_angular_z.set(0.0)
-                    if dvl_attr_covariance is not None:
-                        dvl_attr_covariance.set(dvl_twist_covariance)
-            dvl_ms = (time.perf_counter() - dvl_start) * 1000.0
 
             loop_ms = (time.perf_counter() - loop_start) * 1000.0
             if realtime:
