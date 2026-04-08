@@ -749,8 +749,20 @@ def main() -> None:
     pose_attr_ori_w = _find_attr("inputs:pose:orientation:w")
 
     tf_graph_path = "/ROS2TFGraph"
+    tf_qos_profile = json.dumps(
+        {
+            "history": "keepLast",
+            "depth": 100,
+            "reliability": "reliable",
+            "durability": "volatile",
+            "deadline": 0.0,
+            "lifespan": 0.0,
+            "liveliness": "systemDefault",
+            "leaseDuration": 0.0,
+        }
+    )
     tf_nodes_to_create = [
-        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("BaseTFImpulse", "omni.graph.action.OnImpulseEvent"),
         ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
         ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
         ("PublishBaseTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
@@ -759,15 +771,75 @@ def main() -> None:
         ("PublishBaseTF.inputs:parentFrameId", "World"),
         ("PublishBaseTF.inputs:childFrameId", pose_frame_id),
         ("PublishBaseTF.inputs:nodeNamespace", ros_namespace),
+        ("PublishBaseTF.inputs:qosProfile", tf_qos_profile),
         ("PublishBaseTF.inputs:queueSize", queue_size),
         ("PublishBaseTF.inputs:topicName", "/tf"),
         ("PublishBaseTF.inputs:staticPublisher", False),
     ]
     tf_connections = [
-        ("OnPlaybackTick.outputs:tick", "PublishBaseTF.inputs:execIn"),
+        ("BaseTFImpulse.outputs:execOut", "PublishBaseTF.inputs:execIn"),
         ("ReadSimTime.outputs:simulationTime", "PublishBaseTF.inputs:timeStamp"),
         ("ROS2Context.outputs:context", "PublishBaseTF.inputs:context"),
     ]
+    if rtx_lidar_enabled and rtx_lidar_frame_id is not None:
+        lidar_translation = vec3(rtx_lidar_cfg["translation"], "sensors.rtx_lidar.translation")
+        lidar_orientation_wxyz = quat_wxyz_from_rpy_deg(
+            rtx_lidar_cfg["orientation_rpy_deg"],
+            "sensors.rtx_lidar.orientation_rpy_deg",
+        )
+        tf_nodes_to_create.append(("PublishRtxLidarTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
+        tf_set_values.extend(
+            [
+                ("PublishRtxLidarTF.inputs:parentFrameId", pose_frame_id),
+                ("PublishRtxLidarTF.inputs:childFrameId", rtx_lidar_frame_id),
+                (
+                    "PublishRtxLidarTF.inputs:translation",
+                    [float(lidar_translation[0]), float(lidar_translation[1]), float(lidar_translation[2])],
+                ),
+                (
+                    "PublishRtxLidarTF.inputs:rotation",
+                    [
+                        float(lidar_orientation_wxyz[1]),
+                        float(lidar_orientation_wxyz[2]),
+                        float(lidar_orientation_wxyz[3]),
+                        float(lidar_orientation_wxyz[0]),
+                    ],
+                ),
+                ("PublishRtxLidarTF.inputs:nodeNamespace", ros_namespace),
+                ("PublishRtxLidarTF.inputs:qosProfile", tf_qos_profile),
+                ("PublishRtxLidarTF.inputs:queueSize", queue_size),
+                ("PublishRtxLidarTF.inputs:topicName", "/tf"),
+                ("PublishRtxLidarTF.inputs:staticPublisher", False),
+            ]
+        )
+        tf_connections.extend(
+            [
+                ("BaseTFImpulse.outputs:execOut", "PublishRtxLidarTF.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", "PublishRtxLidarTF.inputs:timeStamp"),
+                ("ROS2Context.outputs:context", "PublishRtxLidarTF.inputs:context"),
+            ]
+        )
+    og.Controller.edit(
+        {"graph_path": tf_graph_path, "evaluator_name": "execution"},
+        {
+            keys.CREATE_NODES: tf_nodes_to_create,
+            keys.SET_VALUES: tf_set_values,
+            keys.CONNECT: tf_connections,
+        },
+    )
+    simulation_app.update()
+    base_tf_translation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:translation")
+    base_tf_rotation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:rotation")
+    base_tf_publish_impulse_attr = og.Controller.attribute(f"{tf_graph_path}/BaseTFImpulse.state:enableImpulse")
+
+    static_tf_graph_path = "/ROS2StaticTFGraph"
+    static_tf_nodes_to_create = [
+        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+        ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+    ]
+    static_tf_set_values = []
+    static_tf_connections = []
 
     static_tf_specs: list[tuple[str, str, list[float], list[float]]] = []
     if bool(uw_camera_cfg["enabled"]):
@@ -791,18 +863,6 @@ def main() -> None:
                 quat_wxyz_from_rpy_deg(
                     imaging_sonar_cfg["orientation_rpy_deg"],
                     "sensors.imaging_sonar.orientation_rpy_deg",
-                ),
-            )
-        )
-    if rtx_lidar_enabled and rtx_lidar_frame_id is not None:
-        static_tf_specs.append(
-            (
-                "RtxLidarTF",
-                rtx_lidar_frame_id,
-                vec3(rtx_lidar_cfg["translation"], "sensors.rtx_lidar.translation"),
-                quat_wxyz_from_rpy_deg(
-                    rtx_lidar_cfg["orientation_rpy_deg"],
-                    "sensors.rtx_lidar.orientation_rpy_deg",
                 ),
             )
         )
@@ -835,8 +895,8 @@ def main() -> None:
             )
         )
     for node_name, child_frame_id, translation, orientation_wxyz in static_tf_specs:
-        tf_nodes_to_create.append((node_name, "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
-        tf_set_values.extend(
+        static_tf_nodes_to_create.append((node_name, "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
+        static_tf_set_values.extend(
             [
                 (f"{node_name}.inputs:parentFrameId", pose_frame_id),
                 (f"{node_name}.inputs:childFrameId", child_frame_id),
@@ -856,7 +916,7 @@ def main() -> None:
                 (f"{node_name}.inputs:staticPublisher", True),
             ]
         )
-        tf_connections.extend(
+        static_tf_connections.extend(
             [
                 ("OnPlaybackTick.outputs:tick", f"{node_name}.inputs:execIn"),
                 ("ReadSimTime.outputs:simulationTime", f"{node_name}.inputs:timeStamp"),
@@ -864,17 +924,16 @@ def main() -> None:
             ]
         )
 
-    og.Controller.edit(
-        {"graph_path": tf_graph_path, "evaluator_name": "execution"},
-        {
-            keys.CREATE_NODES: tf_nodes_to_create,
-            keys.SET_VALUES: tf_set_values,
-            keys.CONNECT: tf_connections,
-        },
-    )
-    simulation_app.update()
-    base_tf_translation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:translation")
-    base_tf_rotation_attr = og.Controller.attribute(f"{tf_graph_path}/PublishBaseTF.inputs:rotation")
+    if static_tf_specs:
+        og.Controller.edit(
+            {"graph_path": static_tf_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: static_tf_nodes_to_create,
+                keys.SET_VALUES: static_tf_set_values,
+                keys.CONNECT: static_tf_connections,
+            },
+        )
+        simulation_app.update()
 
     # Publish /clock for ROS2 time synchronization.
     clock_graph_path = "/ROS2ClockGraph"
@@ -1042,8 +1101,7 @@ def main() -> None:
         {"graph_path": imu_graph_path, "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("IMUPublishImpulse", "omni.graph.action.OnImpulseEvent"),
                 ("ReadIMU", "isaacsim.sensors.physics.IsaacReadIMU"),
                 ("PublishImu", "isaacsim.ros2.bridge.ROS2PublishImu"),
             ],
@@ -1058,17 +1116,19 @@ def main() -> None:
                 ("PublishImu.inputs:publishOrientation", True),
             ],
             keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "ReadIMU.inputs:execIn"),
+                ("IMUPublishImpulse.outputs:execOut", "ReadIMU.inputs:execIn"),
                 ("ReadIMU.outputs:execOut", "PublishImu.inputs:execIn"),
                 ("ReadIMU.outputs:angVel", "PublishImu.inputs:angularVelocity"),
                 ("ReadIMU.outputs:linAcc", "PublishImu.inputs:linearAcceleration"),
                 ("ReadIMU.outputs:orientation", "PublishImu.inputs:orientation"),
-                ("ReadSimTime.outputs:simulationTime", "PublishImu.inputs:timeStamp"),
+                ("ReadIMU.outputs:sensorTime", "PublishImu.inputs:timeStamp"),
             ],
         },
     )
+    simulation_app.update()
+    imu_publish_impulse_attr = og.Controller.attribute(f"{imu_graph_path}/IMUPublishImpulse.state:enableImpulse")
 
-    # 5) Attach OceanSim DVL and publish to ROS2 odometry topic.
+    # 5) Attach OceanSim DVL and publish to ROS2 TwistWithCovarianceStamped topic.
     if not bool(dvl_cfg["enabled"]):
         raise RuntimeError("sensors.dvl.enabled must be true")
 
@@ -1092,9 +1152,26 @@ def main() -> None:
         orientation=quat_wxyz_from_rpy_deg(dvl_cfg["orientation_rpy_deg"], "sensors.dvl.orientation_rpy_deg"),
     )
 
-    dvl_frequency_hz = float(dvl_cfg["frequency_hz"])
     dvl_require_bottom_lock = bool(dvl_cfg.get("require_bottom_lock", True))
     dvl_beam_dropout_threshold = int(dvl_cfg.get("beam_dropout_threshold", 2))
+    dvl_translation_body = np.asarray(vec3(dvl_cfg["translation"], "sensors.dvl.translation"), dtype=float)
+    dvl_orientation_wxyz = np.asarray(
+        quat_wxyz_from_rpy_deg(dvl_cfg["orientation_rpy_deg"], "sensors.dvl.orientation_rpy_deg"),
+        dtype=float,
+    )
+    dvl_rotation_body_from_sensor = rotation_matrix_from_quat(dvl_orientation_wxyz)
+    dvl_sensor_qos_profile = json.dumps(
+        {
+            "history": "keepLast",
+            "depth": 5,
+            "reliability": "bestEffort",
+            "durability": "volatile",
+            "deadline": 0.0,
+            "lifespan": 0.0,
+            "liveliness": "systemDefault",
+            "leaseDuration": 0.0,
+        }
+    )
     dvl_graph_path = "/ROS2DVLGraph"
     og.Controller.edit(
         {"graph_path": dvl_graph_path, "evaluator_name": "execution"},
@@ -1110,6 +1187,7 @@ def main() -> None:
                 ("PublishDVL.inputs:messageSubfolder", "msg"),
                 ("PublishDVL.inputs:messageName", "TwistWithCovarianceStamped"),
                 ("PublishDVL.inputs:nodeNamespace", ros_namespace),
+                ("PublishDVL.inputs:qosProfile", dvl_sensor_qos_profile),
                 ("PublishDVL.inputs:queueSize", queue_size),
             ],
             keys.CONNECT: [
@@ -1228,6 +1306,8 @@ def main() -> None:
         start_time = time.perf_counter()
         try:
             sim_time_seconds += float(_step_size)
+            if imu_publish_impulse_attr is not None:
+                imu_publish_impulse_attr.set(True)
             state = _read_state()
             if state is None:
                 return
@@ -1289,11 +1369,12 @@ def main() -> None:
                         pose_attr_ori_z.set(quat_xyzw[2])
                     if pose_attr_ori_w is not None:
                         pose_attr_ori_w.set(quat_xyzw[3])
-            if render_this_step_flag:
-                if base_tf_translation_attr is not None:
-                    base_tf_translation_attr.set([float(pos[0]), float(pos[1]), float(pos[2])])
-                if base_tf_rotation_attr is not None:
-                    base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+            if base_tf_translation_attr is not None:
+                base_tf_translation_attr.set([float(pos[0]), float(pos[1]), float(pos[2])])
+            if base_tf_rotation_attr is not None:
+                base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+            if base_tf_publish_impulse_attr is not None:
+                base_tf_publish_impulse_attr.set(True)
             if baro_enabled and baro_pub_node is not None:
                 sim_time = sim_time_seconds
                 if baro_period <= 0.0 or baro_last_pub_time < 0.0 or (sim_time - baro_last_pub_time) >= baro_period:
@@ -1329,7 +1410,7 @@ def main() -> None:
                         baro_attr_pressure.set(float(pressure))
                     if baro_attr_variance is not None:
                         baro_attr_variance.set(float(variance))
-            dvl_velocity_sample = dvl_sensor.get_linear_vel_fd(physics_dt=1.0 / physics_hz)
+            dvl_velocity_sample = dvl_sensor.get_linear_vel_fd(physics_dt=float(_step_size))
             if isinstance(dvl_velocity_sample, np.ndarray) and dvl_velocity_sample.shape[0] >= 3:
                 beam_hits = None
                 if dvl_require_bottom_lock:
@@ -1342,10 +1423,16 @@ def main() -> None:
                 ):
                     sim_time = sim_time_seconds
                     sec, nanosec = _split_ros_time(sim_time)
+                    body_rotation = rotation_matrix_from_quat(q)
+                    angular_velocity_body = body_rotation.T @ ang_world
+                    dvl_velocity_body = np.asarray(dvl_velocity_sample[:3], dtype=float) + np.cross(
+                        angular_velocity_body, dvl_translation_body
+                    )
+                    dvl_velocity_sensor = dvl_rotation_body_from_sensor.T @ dvl_velocity_body
                     dvl_velocity = [
-                        float(dvl_velocity_sample[0]),
-                        float(dvl_velocity_sample[1]),
-                        float(dvl_velocity_sample[2]),
+                        float(dvl_velocity_sensor[0]),
+                        float(dvl_velocity_sensor[1]),
+                        float(dvl_velocity_sensor[2]),
                     ]
                     dvl_angular_velocity = [0.0, 0.0, 0.0]
                     if dvl_attr_header is not None:
