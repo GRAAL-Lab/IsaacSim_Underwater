@@ -114,7 +114,7 @@
     "rtx_lidar": {
       "enabled": true,
       "name": "ThreeDSonarLowFrequency",
-      "config_path": "/home/attia/IsaacSim_Underwater/Assets/ThreeDSonar_LowFrequency.json",
+      "config_path": "Assets/ThreeDSonar_LowFrequency.json",
       "prim_path": "/World/BROV_low/ThreeDSonar",
       "translation": [
         0.09382,
