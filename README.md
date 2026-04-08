@@ -2,6 +2,8 @@
 
 IsaacSim Underwater is a GPU-accelerated underwater robotics simulation in NVIDIA Isaac Sim 5.1. It packages a full vehicle + sensor stack in one run. The hydrodynamics follow the 6-DOF model described in the reference at the end of this README [1].
 
+![Simulation overview](docs/simgif.gif)
+
 1. Hydrodynamic vehicle dynamics (Thor I. Fossen 6-DOF model)
 2. 3D Sonar (Waterlinked 3D-15, simulated with RTX Lidar)
 3. 2D Imaging Sonar (Oculus M750d, OceanSim model)
@@ -181,6 +183,8 @@ print('mvm_py import OK:', mvm_py)
 This repository expects an `Assets/` folder containing the USD scenes and sensor definitions, download them from Google Drive and place them here:
 - `IsaacSim_Underwater/Assets/`
 
+![Scene overview](docs/scn.png)
+
 **Google Drive link:** `https://drive.google.com/drive/folders/1qZrrGMX0y0dMRY5mIX7Zr-NnPO7HEYy7?usp=sharing`
 
 After extracting, you should see files like:
@@ -304,6 +308,8 @@ The 2D imaging sonar:
 ### 3D Sonar Simulation via RTX Lidar
 The 3D sonar in this simulation is implemented using Isaac Sim's RTX Lidar sensor. This approach leverages GPU-accelerated ray tracing to emulate a solid-state 3D sonar, producing point clouds similar to those from real underwater sonars. This is a geometry-driven approximation, inspired by real 3D sonar firing patterns, but does not yet model full underwater acoustic propagation or multipath effects.
 
+![3D sonar point cloud](docs/3DSonar.png)
+
 You can create an RTX Lidar (used as a 3D sonar) under the vehicle from a custom JSON lidar profile and publish its point cloud through Isaac Sim's native ROS2 bridge.
 
 Configure it in `config/sim_params.json` under `sensors.rtx_lidar`:
@@ -355,6 +361,10 @@ This repo’s current public implementation focuses on:
 
 The underwater image processing runs **inside** `run_underwater_sim.py` using OceanSim rendering and publishes through the Isaac Sim ROS2 bridge.
 
+![Camera view](docs/camera.png)
+
+![Underwater camera rendering](docs/UWCamera.png)
+
 You only need to run the simulation:
 ```bash
 "$ISAACSIM_ROOT/python.sh" \
@@ -377,6 +387,8 @@ The underwater effect parameters come from:
 ## Imaging sonar output
 
 The 2D imaging sonar runs inside `run_underwater_sim.py` using OceanSim’s `ImagingSonarSensor` and publishes through the Isaac Sim ROS2 bridge.
+
+![2D imaging sonar](docs/2Dsonar.png)
 
 Sonar topic:
 - imaging sonar image: `sensors.imaging_sonar.ros2_topic` (default: `/IsaacSim/imaging_sonar/image_raw`)
