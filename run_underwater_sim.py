@@ -1,6 +1,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -454,7 +455,11 @@ def _rtx_lidar_usd_value(value):
 def _build_rtx_lidar_prim_creation_kwargs(profile: dict) -> dict:
     emitter_states = profile.get("emitterStates", [])
     emitter_state_count = min(int(profile.get("emitterStateCount", 0)), len(emitter_states))
-    prim_creation_kwargs = {}
+    prim_creation_kwargs = {
+        f"omni:sensor:Core:{field}": int(round(float(profile[field])))
+        for field in ("scanRateBaseHz", "reportRateBaseHz")
+        if field in profile
+    }
     for i in range(emitter_state_count):
         if i < 2:
             continue
@@ -476,6 +481,63 @@ def _set_rtx_lidar_attribute_if_present(prim, attribute: str, value) -> bool:
         except Exception:
             return False
     return False
+
+
+def _select_rtx_lidar_frame_skip_count(
+    measured_render_hz: float,
+    target_publish_hz: float,
+    current_frame_skip_count: int,
+    min_frame_skip_count: int,
+    max_frame_skip_count: int,
+    tolerance_hz: float,
+) -> int:
+    """Choose the integer frame skip whose estimated publish rate is closest to the target."""
+    if measured_render_hz <= 0.0 or target_publish_hz <= 0.0:
+        return current_frame_skip_count
+
+    current_publish_hz = measured_render_hz / float(current_frame_skip_count + 1)
+    if abs(current_publish_hz - target_publish_hz) <= tolerance_hz:
+        return current_frame_skip_count
+
+    ideal_publish_step = measured_render_hz / target_publish_hz
+    candidate_steps = {
+        int(math.floor(ideal_publish_step)),
+        int(math.ceil(ideal_publish_step)),
+        current_frame_skip_count + 1,
+    }
+    min_publish_step = min_frame_skip_count + 1
+    max_publish_step = max_frame_skip_count + 1
+    candidate_frame_skips = {
+        min(max(step, min_publish_step), max_publish_step) - 1 for step in candidate_steps
+    }
+
+    return min(
+        candidate_frame_skips,
+        key=lambda frame_skip: (
+            abs(measured_render_hz / float(frame_skip + 1) - target_publish_hz),
+            abs(frame_skip - current_frame_skip_count),
+            frame_skip,
+        ),
+    )
+
+
+def _advance_publication_deadline(
+    sim_time: float,
+    next_publish_time: float,
+    period: float,
+) -> tuple[bool, float]:
+    """Advance a periodic deadline without accumulating floating-point drift."""
+    if period <= 0.0:
+        return True, sim_time
+    if next_publish_time < 0.0:
+        return True, sim_time + period
+
+    epsilon = max(1e-12, period * 1e-9)
+    if sim_time + epsilon < next_publish_time:
+        return False, next_publish_time
+
+    periods_elapsed = max(1, int(math.floor((sim_time + epsilon - next_publish_time) / period)) + 1)
+    return True, next_publish_time + periods_elapsed * period
 
 
 def _apply_custom_rtx_lidar_profile(prim, config: dict) -> None:
@@ -666,6 +728,7 @@ def main() -> None:
     import omni.graph.core as og
     import omni.kit.commands
     import omni.replicator.core as rep
+    import omni.syntheticdata
     import usdrt.Sdf
     from pxr import Gf, Sdf
 
@@ -722,6 +785,14 @@ def main() -> None:
     rtx_lidar_cfg = sensors_cfg.get("rtx_lidar", {})
     rtx_lidar_enabled = bool(rtx_lidar_cfg.get("enabled", False))
     rtx_lidar_frame_id = None
+    rtx_lidar_render_product = None
+    rtx_lidar_render_product_path = None
+    rtx_lidar_publish_frame_skip_attr = None
+    rtx_lidar_current_frame_skip_count = max(0, int(rtx_lidar_cfg.get("frame_skip_count", 0)))
+    rtx_rate_cfg = rtx_lidar_cfg.get("adaptive_frame_skip", {})
+    if not isinstance(rtx_rate_cfg, dict):
+        raise ValueError("sensors.rtx_lidar.adaptive_frame_skip must be an object")
+    rtx_rate_control_enabled = rtx_lidar_enabled and bool(rtx_rate_cfg.get("enabled", False))
     if rtx_lidar_enabled:
         rtx_lidar_config_path = _resolve_path(str(rtx_lidar_cfg["config_path"]), config_root)
         rtx_lidar_profile = _load_custom_rtx_lidar_profile(rtx_lidar_config_path)
@@ -767,6 +838,13 @@ def main() -> None:
                 "omni.sensors.nv.lidar.lidar_core.plugin"
             )
         _apply_custom_rtx_lidar_profile(rtx_lidar_prim, rtx_lidar_profile)
+        authored_rates = []
+        for field in ("scanRateBaseHz", "reportRateBaseHz"):
+            rate_attr = rtx_lidar_prim.GetAttribute(f"omni:sensor:Core:{field}")
+            if rate_attr.IsValid():
+                authored_rates.append(f"{field}={rate_attr.Get()} ({rate_attr.GetTypeName()})")
+        if authored_rates:
+            print(f"[RTX lidar] Authored profile rates: {', '.join(authored_rates)}")
 
         rtx_lidar_render_product = rep.create.render_product(
             created_lidar_path,
@@ -793,8 +871,11 @@ def main() -> None:
                     ("PublishRtxLidar.inputs:topicName", str(rtx_lidar_cfg["ros2_topic"])),
                     ("PublishRtxLidar.inputs:frameId", str(rtx_lidar_cfg["ros2_frame_id"])),
                     ("PublishRtxLidar.inputs:type", "point_cloud"),
-                    ("PublishRtxLidar.inputs:fullScan", True),
-                    ("PublishRtxLidar.inputs:frameSkipCount", int(rtx_lidar_cfg["frame_skip_count"])),
+                    ("PublishRtxLidar.inputs:fullScan", bool(rtx_lidar_cfg.get("full_scan", True))),
+                    (
+                        "PublishRtxLidar.inputs:frameSkipCount",
+                        rtx_lidar_current_frame_skip_count,
+                    ),
                     ("PublishRtxLidar.inputs:showDebugView", bool(rtx_lidar_cfg["show_debug_view"])),
                     ("PublishRtxLidar.inputs:nodeNamespace", ros_namespace),
                     ("PublishRtxLidar.inputs:queueSize", queue_size),
@@ -803,6 +884,9 @@ def main() -> None:
             },
         )
         simulation_app.update()
+        rtx_lidar_publish_frame_skip_attr = og.Controller.attribute(
+            f"{rtx_lidar_graph_path}/PublishRtxLidar.inputs:frameSkipCount"
+        )
         rtx_lidar_frame_id = str(rtx_lidar_cfg["ros2_frame_id"])
 
     # Simulation timing.
@@ -811,7 +895,72 @@ def main() -> None:
     realtime = bool(sim_cfg["timing"].get("realtime", False))
     if physics_hz <= 0.0 or render_fps <= 0.0:
         raise ValueError("simulation.timing.physics_hz and render_fps must be > 0")
+    if render_fps > physics_hz:
+        raise ValueError("simulation.timing.render_fps cannot exceed physics_hz in the manual step loop")
     render_every = max(1, int(round(physics_hz / render_fps)))
+    effective_render_hz = physics_hz / float(render_every)
+
+    rtx_target_publish_hz = float(rtx_rate_cfg.get("target_publish_hz", 6.0))
+    rtx_rate_domain = str(rtx_rate_cfg.get("rate_domain", "simulation")).strip().lower()
+    rtx_rate_tolerance_hz = float(rtx_rate_cfg.get("tolerance_hz", 0.5))
+    rtx_rate_measurement_window_s = float(rtx_rate_cfg.get("measurement_window_s", 5.0))
+    rtx_rate_warmup_s = float(rtx_rate_cfg.get("warmup_s", 3.0))
+    rtx_rate_smoothing_factor = float(rtx_rate_cfg.get("smoothing_factor", 0.5))
+    rtx_min_frame_skip_count = int(rtx_rate_cfg.get("min_frame_skip_count", 0))
+    rtx_max_frame_skip_count = int(rtx_rate_cfg.get("max_frame_skip_count", 120))
+    if rtx_rate_control_enabled:
+        if rtx_rate_domain not in {"simulation", "wall"}:
+            raise ValueError("sensors.rtx_lidar.adaptive_frame_skip.rate_domain must be 'simulation' or 'wall'")
+        if rtx_target_publish_hz <= 0.0:
+            raise ValueError("sensors.rtx_lidar.adaptive_frame_skip.target_publish_hz must be > 0")
+        if rtx_rate_domain == "simulation" and rtx_target_publish_hz > effective_render_hz:
+            raise ValueError("RTX lidar target_publish_hz cannot exceed the effective simulation render rate")
+        if rtx_rate_tolerance_hz < 0.0:
+            raise ValueError("sensors.rtx_lidar.adaptive_frame_skip.tolerance_hz must be >= 0")
+        if rtx_rate_measurement_window_s <= 0.0 or rtx_rate_warmup_s < 0.0:
+            raise ValueError("RTX lidar rate-control measurement_window_s must be > 0 and warmup_s must be >= 0")
+        if not 0.0 < rtx_rate_smoothing_factor <= 1.0:
+            raise ValueError("sensors.rtx_lidar.adaptive_frame_skip.smoothing_factor must be in (0, 1]")
+        if rtx_min_frame_skip_count < 0 or rtx_max_frame_skip_count < rtx_min_frame_skip_count:
+            raise ValueError("RTX lidar rate-control frame-skip bounds are invalid")
+        rtx_lidar_current_frame_skip_count = min(
+            max(rtx_lidar_current_frame_skip_count, rtx_min_frame_skip_count),
+            rtx_max_frame_skip_count,
+        )
+        rtx_lidar_current_frame_skip_count = _select_rtx_lidar_frame_skip_count(
+            measured_render_hz=effective_render_hz,
+            target_publish_hz=rtx_target_publish_hz,
+            current_frame_skip_count=rtx_lidar_current_frame_skip_count,
+            min_frame_skip_count=rtx_min_frame_skip_count,
+            max_frame_skip_count=rtx_max_frame_skip_count,
+            tolerance_hz=rtx_rate_tolerance_hz,
+        )
+        rtx_lidar_render_fraction = 1.0 / float(rtx_lidar_current_frame_skip_count + 1)
+        if rtx_lidar_publish_frame_skip_attr is not None:
+            rtx_lidar_publish_frame_skip_attr.set(rtx_lidar_current_frame_skip_count)
+    else:
+        rtx_lidar_render_fraction = 1.0
+
+    for sensor_name in ("dvl", "imu", "barometer", "magnetometer"):
+        sensor_cfg = sensors_cfg.get(sensor_name, {})
+        if not bool(sensor_cfg.get("enabled", False)):
+            continue
+        sensor_frequency = float(sensor_cfg.get("frequency_hz", 0.0))
+        if sensor_frequency <= 0.0 or sensor_frequency > physics_hz:
+            raise ValueError(
+                f"sensors.{sensor_name}.frequency_hz must be in (0, simulation.timing.physics_hz]"
+            )
+
+    for sensor_name in ("uw_camera", "imaging_sonar"):
+        sensor_cfg = sensors_cfg.get(sensor_name, {})
+        if not bool(sensor_cfg.get("enabled", False)):
+            continue
+        sensor_frequency = float(sensor_cfg.get("frequency_hz", 0.0))
+        if sensor_frequency <= 0.0 or sensor_frequency > effective_render_hz + 1e-9:
+            raise ValueError(
+                f"sensors.{sensor_name}.frequency_hz must be in (0, effective render rate "
+                f"{effective_render_hz:.3f} Hz]"
+            )
 
     world = World(
         stage_units_in_meters=1.0,
@@ -864,6 +1013,7 @@ def main() -> None:
     # 3) Attach OceanSim camera and publish raw + underwater images.
     uw_camera_cfg = sensors_cfg["uw_camera"]
     uw_camera = None
+    camera_frame_skip = 0
     processed_image_data_attr = None
     processed_image_buffer_size_attr = None
     processed_image_width_attr = None
@@ -891,7 +1041,10 @@ def main() -> None:
         )
 
         camera_graph_path = "/ROS2UWCameraGraph"
-        camera_frame_skip = max(0, int(round(render_fps / max(float(uw_camera_cfg["frequency_hz"]), 1e-6))) - 1)
+        camera_frame_skip = max(
+            0,
+            int(round(effective_render_hz / max(float(uw_camera_cfg["frequency_hz"]), 1e-6))) - 1,
+        )
         og.Controller.edit(
             {"graph_path": camera_graph_path, "evaluator_name": "execution"},
             {
@@ -1344,6 +1497,7 @@ def main() -> None:
 
     baro_enabled = bool(baro_cfg.get("enabled", False))
     baro_pub_node = None
+    baro_graph = None
     baro_publish_impulse_attr = None
     baro_attr_header = None
     baro_attr_frame_id = None
@@ -1351,7 +1505,7 @@ def main() -> None:
     baro_attr_stamp_nsec = None
     baro_attr_pressure = None
     baro_attr_variance = None
-    baro_last_pub_time = -1.0
+    baro_next_pub_time = -1.0
     baro_period = 0.0
     baro_rng_seed = baro_cfg.get("random_seed", 11)
     baro_rng = np.random.default_rng(None if baro_rng_seed is None else int(baro_rng_seed))
@@ -1393,6 +1547,8 @@ def main() -> None:
             },
         )
         simulation_app.update()
+        baro_graph = og.Controller.graph(baro_graph_path)
+        baro_graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
         baro_publish_impulse_attr = og.Controller.attribute(
             f"{baro_graph_path}/BarometerPublishImpulse.state:enableImpulse"
         )
@@ -1414,6 +1570,7 @@ def main() -> None:
 
     magnetometer_enabled = bool(magnetometer_cfg.get("enabled", False))
     magnetometer_pub_node = None
+    magnetometer_graph = None
     magnetometer_publish_impulse_attr = None
     magnetometer_attr_header = None
     magnetometer_attr_frame_id = None
@@ -1424,7 +1581,7 @@ def main() -> None:
     magnetometer_attr_field_y = None
     magnetometer_attr_field_z = None
     magnetometer_attr_covariance = None
-    magnetometer_last_pub_time = -1.0
+    magnetometer_next_pub_time = -1.0
     magnetometer_period = 0.0
     magnetometer_rng_seed = magnetometer_cfg.get("random_seed", 42)
     magnetometer_rng = np.random.default_rng(None if magnetometer_rng_seed is None else int(magnetometer_rng_seed))
@@ -1475,6 +1632,8 @@ def main() -> None:
             },
         )
         simulation_app.update()
+        magnetometer_graph = og.Controller.graph(magnetometer_graph_path)
+        magnetometer_graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
         magnetometer_publish_impulse_attr = og.Controller.attribute(
             f"{magnetometer_graph_path}/MagnetometerPublishImpulse.state:enableImpulse"
         )
@@ -1534,7 +1693,7 @@ def main() -> None:
     )
 
     imu_period = 1.0 / float(imu_cfg["frequency_hz"]) if float(imu_cfg["frequency_hz"]) > 0.0 else 0.0
-    imu_last_pub_time = -1.0
+    imu_next_pub_time = -1.0
     imu_rng_seed = imu_cfg.get("random_seed", 7)
     imu_rng = np.random.default_rng(None if imu_rng_seed is None else int(imu_rng_seed))
     imu_noise_cfg = imu_cfg.get("noise", {}) if isinstance(imu_cfg.get("noise", {}), dict) else {}
@@ -1575,6 +1734,8 @@ def main() -> None:
         },
     )
     simulation_app.update()
+    imu_graph = og.Controller.graph(imu_graph_path)
+    imu_graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
     imu_publish_impulse_attr = og.Controller.attribute(f"{imu_graph_path}/IMUPublishImpulse.state:enableImpulse")
     imu_pub_node = og.Controller.node(f"{imu_graph_path}/PublishImu")
     imu_pub_attrs = {attr.get_name(): attr for attr in imu_pub_node.get_attributes()}
@@ -1692,6 +1853,8 @@ def main() -> None:
         },
     )
     simulation_app.update()
+    dvl_graph = og.Controller.graph(dvl_graph_path)
+    dvl_graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
     dvl_pub_node = og.Controller.node(f"{dvl_graph_path}/PublishDVL")
     dvl_publish_impulse_attr = og.Controller.attribute(f"{dvl_graph_path}/DVLPublishImpulse.state:enableImpulse")
     dvl_pub_attrs = {attr.get_name(): attr for attr in dvl_pub_node.get_attributes()}
@@ -1823,9 +1986,9 @@ def main() -> None:
     render_this_step_flag = False
 
     def _on_physics_step(_step_size: float) -> None:
-        nonlocal baro_last_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag, sim_time_seconds
+        nonlocal baro_next_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag, sim_time_seconds
         nonlocal dvl_dropout_until_time, dvl_last_dropout_start_time
-        nonlocal imu_last_pub_time, magnetometer_last_pub_time
+        nonlocal imu_next_pub_time, magnetometer_next_pub_time
         start_time = time.perf_counter()
         try:
             sim_time_seconds += float(_step_size)
@@ -1900,8 +2063,12 @@ def main() -> None:
                 base_tf_publish_impulse_attr.set(True)
             if baro_enabled and baro_pub_node is not None:
                 sim_time = sim_time_seconds
-                if baro_period <= 0.0 or baro_last_pub_time < 0.0 or (sim_time - baro_last_pub_time) >= baro_period:
-                    baro_last_pub_time = sim_time
+                baro_publish_due, baro_next_pub_time = _advance_publication_deadline(
+                    sim_time,
+                    baro_next_pub_time,
+                    baro_period,
+                )
+                if baro_publish_due:
                     sec = int(sim_time)
                     nanosec = int(round((sim_time - sec) * 1e9))
                     if nanosec >= 1_000_000_000:
@@ -1942,14 +2109,15 @@ def main() -> None:
                         baro_attr_variance.set(float(variance))
                     if baro_publish_impulse_attr is not None:
                         baro_publish_impulse_attr.set(True)
+                        og.Controller.evaluate_sync(baro_graph)
             if magnetometer_enabled and magnetometer_pub_node is not None:
                 sim_time = sim_time_seconds
-                if (
-                    magnetometer_period <= 0.0
-                    or magnetometer_last_pub_time < 0.0
-                    or (sim_time - magnetometer_last_pub_time) >= magnetometer_period
-                ):
-                    magnetometer_last_pub_time = sim_time
+                magnetometer_publish_due, magnetometer_next_pub_time = _advance_publication_deadline(
+                    sim_time,
+                    magnetometer_next_pub_time,
+                    magnetometer_period,
+                )
+                if magnetometer_publish_due:
                     sec, nanosec = _split_ros_time(sim_time)
                     magnetic_field = _simulate_magnetometer_measurement(
                         orientation_wxyz=q,
@@ -1999,6 +2167,7 @@ def main() -> None:
                         magnetometer_attr_covariance.set(magnetometer_covariance)
                     if magnetometer_publish_impulse_attr is not None:
                         magnetometer_publish_impulse_attr.set(True)
+                        og.Controller.evaluate_sync(magnetometer_graph)
             dvl_velocity_sample = dvl_sensor.get_linear_vel_fd(physics_dt=float(_step_size))
             if isinstance(dvl_velocity_sample, np.ndarray) and dvl_velocity_sample.shape[0] >= 3:
                 sim_time = sim_time_seconds
@@ -2125,12 +2294,17 @@ def main() -> None:
                             dvl_attr_covariance.set(dvl_twist_covariance)
                     if dvl_publish_impulse_attr is not None:
                         dvl_publish_impulse_attr.set(True)
+                        og.Controller.evaluate_sync(dvl_graph)
             pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
                 pos, q, lin_world, ang_world
             )
             sim_time = sim_time_seconds
-            if imu_period <= 0.0 or imu_last_pub_time < 0.0 or (sim_time - imu_last_pub_time) >= imu_period:
-                imu_last_pub_time = sim_time
+            imu_publish_due, imu_next_pub_time = _advance_publication_deadline(
+                sim_time,
+                imu_next_pub_time,
+                imu_period,
+            )
+            if imu_publish_due:
                 sec, nanosec = _split_ros_time(sim_time)
                 (
                     imu_orientation_wxyz,
@@ -2250,6 +2424,7 @@ def main() -> None:
                     imu_attr_linear_acceleration_covariance.set(imu_linear_acceleration_covariance)
                 if imu_publish_impulse_attr is not None:
                     imu_publish_impulse_attr.set(True)
+                    og.Controller.evaluate_sync(imu_graph)
             if velocity_attr_twist is not None:
                 velocity_attr_twist.set(
                     json.dumps(
@@ -2350,12 +2525,34 @@ def main() -> None:
 
     try:
         main_loop_frame = 0
+        rtx_rate_control_started_at = time.perf_counter()
+        rtx_rate_window_started_at = None
+        rtx_rate_window_sim_started_at = None
+        rtx_rate_rendered_frames = 0
+        rtx_rate_lidar_frames = 0
+        rtx_smoothed_control_render_hz = None
+        rtx_lidar_render_accumulator = 0.0
+        if rtx_rate_control_enabled:
+            print(
+                "[RTX lidar rate control] "
+                f"target={rtx_target_publish_hz:.2f} Hz, "
+                f"rate_domain={rtx_rate_domain}, "
+                f"initial frame_skip_count={rtx_lidar_current_frame_skip_count}"
+            )
         while simulation_app.is_running():
             loop_start = time.perf_counter()
             render_this_step = (main_loop_frame % render_every) == 0
             render_this_step_flag = render_this_step
+            rtx_lidar_render_this_step = False
+            if rtx_rate_control_enabled and render_this_step:
+                rtx_lidar_render_accumulator += rtx_lidar_render_fraction
+                if rtx_lidar_render_accumulator >= 1.0 - 1e-9:
+                    rtx_lidar_render_this_step = True
+                    rtx_lidar_render_accumulator -= 1.0
             step_start = time.perf_counter()
-            world.step(render=render_this_step)
+            world.step(render=False)
+            if render_this_step:
+                world.render()
             step_ms = (time.perf_counter() - step_start) * 1000.0
 
             camera_ms = 0.0
@@ -2371,6 +2568,112 @@ def main() -> None:
                 if sleep_ms > 0.0:
                     time.sleep(sleep_ms / 1000.0)
                     loop_ms = (time.perf_counter() - loop_start) * 1000.0
+
+            if rtx_rate_control_enabled:
+                rate_now = time.perf_counter()
+                if (rate_now - rtx_rate_control_started_at) >= rtx_rate_warmup_s:
+                    if rtx_rate_window_started_at is None:
+                        rtx_rate_window_started_at = rate_now
+                        rtx_rate_window_sim_started_at = sim_time_seconds
+                        rtx_rate_rendered_frames = 0
+                        rtx_rate_lidar_frames = 0
+                    else:
+                        if render_this_step:
+                            rtx_rate_rendered_frames += 1
+                        if rtx_lidar_render_this_step:
+                            rtx_rate_lidar_frames += 1
+                        wall_elapsed = rate_now - rtx_rate_window_started_at
+                        sim_elapsed = sim_time_seconds - float(rtx_rate_window_sim_started_at)
+                        if wall_elapsed >= rtx_rate_measurement_window_s and sim_elapsed > 0.0:
+                            measured_render_wall_hz = rtx_rate_rendered_frames / wall_elapsed
+                            measured_lidar_wall_hz = rtx_rate_lidar_frames / wall_elapsed
+                            measured_render_sim_hz = rtx_rate_rendered_frames / sim_elapsed
+                            measured_lidar_sim_hz = rtx_rate_lidar_frames / sim_elapsed
+                            if rtx_rate_domain == "simulation":
+                                measured_control_render_hz = measured_render_sim_hz
+                                measured_control_lidar_hz = measured_lidar_sim_hz
+                            else:
+                                measured_control_render_hz = measured_render_wall_hz
+                                measured_control_lidar_hz = measured_lidar_wall_hz
+
+                            if rtx_smoothed_control_render_hz is None:
+                                rtx_smoothed_control_render_hz = measured_control_render_hz
+                            else:
+                                rtx_smoothed_control_render_hz = (
+                                    rtx_rate_smoothing_factor * measured_control_render_hz
+                                    + (1.0 - rtx_rate_smoothing_factor) * rtx_smoothed_control_render_hz
+                                )
+
+                            previous_frame_skip_count = rtx_lidar_current_frame_skip_count
+                            if abs(measured_control_lidar_hz - rtx_target_publish_hz) > rtx_rate_tolerance_hz:
+                                min_render_fraction = 1.0 / float(rtx_max_frame_skip_count + 1)
+                                max_render_fraction = 1.0 / float(rtx_min_frame_skip_count + 1)
+                                rtx_lidar_render_fraction = min(
+                                    max(
+                                        rtx_target_publish_hz
+                                        / max(rtx_smoothed_control_render_hz, 1e-9),
+                                        min_render_fraction,
+                                    ),
+                                    max_render_fraction,
+                                )
+                                rtx_lidar_current_frame_skip_count = max(
+                                    rtx_min_frame_skip_count,
+                                    min(
+                                        rtx_max_frame_skip_count,
+                                        int(round(1.0 / rtx_lidar_render_fraction)) - 1,
+                                    ),
+                                )
+                                if previous_frame_skip_count != rtx_lidar_current_frame_skip_count:
+                                    rtx_lidar_publish_frame_skip_attr.set(rtx_lidar_current_frame_skip_count)
+                                    try:
+                                        omni.syntheticdata.SyntheticData.Get().set_node_attributes(
+                                            "PostProcessDispatchIsaacSimulationGate",
+                                            {"inputs:step": rtx_lidar_current_frame_skip_count + 1},
+                                            rtx_lidar_render_product_path,
+                                        )
+                                    except Exception:
+                                        pass
+
+                            estimated_publish_hz = rtx_smoothed_control_render_hz * rtx_lidar_render_fraction
+                            real_time_factor = sim_elapsed / wall_elapsed
+                            camera_rate_text = ""
+                            if uw_camera is not None:
+                                camera_divisor = float(camera_frame_skip + 1)
+                                camera_rate_text = (
+                                    f", camera sim/wall estimate="
+                                    f"{measured_render_sim_hz / camera_divisor:.2f}/"
+                                    f"{measured_render_wall_hz / camera_divisor:.2f} Hz"
+                                )
+                            print(
+                                "[RTX lidar rate control] "
+                                f"render sim/wall={measured_render_sim_hz:.2f}/"
+                                f"{measured_render_wall_hz:.2f} Hz, "
+                                f"lidar sim/wall={measured_lidar_sim_hz:.2f}/"
+                                f"{measured_lidar_wall_hz:.2f} Hz, "
+                                f"RTF={real_time_factor:.3f}, "
+                                f"next {rtx_rate_domain} estimate={estimated_publish_hz:.2f} Hz, "
+                                f"effective frame_skip_count={previous_frame_skip_count}"
+                                + (
+                                    f" -> {rtx_lidar_current_frame_skip_count}"
+                                    if previous_frame_skip_count != rtx_lidar_current_frame_skip_count
+                                    else ""
+                                )
+                                + camera_rate_text
+                            )
+                            if (
+                                rtx_rate_domain == "simulation"
+                                and measured_lidar_wall_hz + rtx_rate_tolerance_hz < rtx_target_publish_hz
+                            ):
+                                print(
+                                    "[Sensor performance warning] "
+                                    f"The {rtx_target_publish_hz:.2f} Hz simulated lidar cadence is maintained, "
+                                    f"but wall-clock delivery is {measured_lidar_wall_hz:.2f} Hz "
+                                    f"because RTF={real_time_factor:.3f}."
+                                )
+                            rtx_rate_window_started_at = rate_now
+                            rtx_rate_window_sim_started_at = sim_time_seconds
+                            rtx_rate_rendered_frames = 0
+                            rtx_rate_lidar_frames = 0
             main_loop_frame += 1
     finally:
         world.remove_physics_callback("mvm_dynamics")

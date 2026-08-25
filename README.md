@@ -11,7 +11,7 @@ IsaacSim Underwater is a GPU-accelerated underwater robotics simulation in NVIDI
 5. DVL (Waterlinked A50, OceanSim model)
 6. Barometer (OceanSim model)
 7. IMU (Isaac Sim physics IMU)
-8. Magnetometer (PNI RM3100-style model)
+8. Magnetometer (Blue Robotics Navigator MMC5983-style model)
 
 ---
 
@@ -326,14 +326,38 @@ Configure it in `config/sim_params.json` under `sensors.rtx_lidar`:
 - `orientation_rpy_deg`
 - `ros2_topic`
 - `ros2_frame_id`
+- `full_scan`
 - `frame_skip_count`
+- `adaptive_frame_skip.*`
 - `show_debug_view`
 
 Behavior:
 - the script creates a generic `OmniLidar` under `sensors.rtx_lidar.prim_path`, which should be a child of the robot prim
 - the lidar JSON profile is applied directly onto the created sensor's `omni:sensor:Core:*` attributes at runtime
 - ROS2 publication is created from Python with `ROS2RtxLidarHelper`
-- full-scan point cloud publishing is always enabled
+- `full_scan=true` waits for Isaac's full-scan accumulator; `false` publishes the current RTX scan each rendered frame and is appropriate for the one-state solid-state sonar profile
+- when `adaptive_frame_skip.enabled` is true, the script measures render throughput and updates Isaac's RTX post-process/publication gate to keep the point-cloud cadence near `target_publish_hz`
+- `adaptive_frame_skip.rate_domain=simulation` preserves the physical sensor cadence per simulated second and reports the lower wall-clock rate when the simulation cannot run in real time; `wall` is available for throughput experiments but changes the rate per simulated second when RTF is not 1.0
+- the controller uses `frame_skip_count` as its initial hint, waits for `warmup_s`, then updates a fractional render cadence after each `measurement_window_s`; `tolerance_hz`, smoothing, and frame-skip bounds prevent rapid oscillation
+- frame skipping limits publication/post-processing frequency, but it does not make the RTX sensor render faster; the render product remains active because disabling it between 30 Hz camera frames prevents Isaac's asynchronous point-cloud annotator from completing
+- both low-frequency 3D sonar profiles use `scanRateBaseHz=6` and `reportRateBaseHz=6` for the experiment; Water Linked's current Sonar 3D-15 datasheet specifies 5 Hz in low-frequency mode, so 6 Hz is an intentional experimental setting rather than a manufacturer-exact value
+- `simulation.timing.render_fps=30` supplies the camera's 30 Hz cadence; the RTX lidar render product is independently gated to 6 Hz
+- the controller reports completed lidar renders without subscribing to the large `PointCloud2` topic; use `ros2 topic hz /sonar_point_cloud` to measure the final DDS delivery rate
+
+### Configured sensor rates
+
+Rates are scheduled in simulation time. When real-time factor (RTF) is below 1.0, wall-clock ROS rates are approximately `configured_rate * RTF`.
+
+| Sensor | Configured rate | Basis |
+| --- | ---: | --- |
+| Underwater camera | 30 Hz | Requested camera stream rate and global render cadence |
+| Water Linked A50-style DVL | 15 Hz | Near-range maximum; the real A50 uses altitude-dependent range modes from 15 Hz down to 2-4 Hz |
+| Water Linked 3D-15-style low-frequency sonar | 6 Hz | Experimental target; current manufacturer low-frequency specification is 5 Hz |
+| Navigator ICM-20602-style IMU | 300 Hz | Simulation physics ceiling; the device supports substantially higher raw ODR |
+| Navigator MMC5983-style magnetometer | 300 Hz | Simulation physics ceiling; the device supports up to 1000 Hz ODR |
+| Bar30/MS5837-30BA-style pressure | 25 Hz | Approximately one high-resolution pressure and temperature read every 40 ms |
+
+References: [Water Linked A50 range modes](https://docs.waterlinked.com/dvl/range-mode/), [Water Linked Sonar 3D-15 datasheet](https://waterlinked.com/datasheets/sonar-3D-15), [Navigator specifications](https://bluerobotics.com/store/comm-control-power/control/navigator/), [ICM-20602 datasheet](https://invensense.tdk.com/wp-content/uploads/2020/11/DS-000176-ICM-20602-v1.1.pdf), [MMC5983MA datasheet](https://www.memsic.com/Public/Uploads/uploadfile/files/20220119/MMC5983MADatasheetRevA.pdf), and [Blue Robotics MS5837 library](https://github.com/bluerobotics/BlueRobotics_MS5837_Library).
 - no OmniGraph needs to be pre-authored in a lidar asset
 
 
