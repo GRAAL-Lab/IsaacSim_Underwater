@@ -60,6 +60,297 @@ def _build_oceansim_uw_params(uw_camera_cfg: dict) -> np.ndarray:
     return np.concatenate((backscatter_value, backscatter_coeff, atten_coeff)).astype(np.float32, copy=False)
 
 
+def _as_float_array(values, field_name: str, expected_size: int) -> np.ndarray:
+    array = np.asarray(values, dtype=float).reshape(-1)
+    if array.size != expected_size:
+        raise ValueError(f"{field_name} must contain {expected_size} values")
+    return array
+
+
+def _diag_covariance(diagonal_values: np.ndarray) -> list[float]:
+    covariance = [0.0] * 9
+    for axis in range(3):
+        covariance[axis * 3 + axis] = float(diagonal_values[axis])
+    return covariance
+
+
+def _vector_noise_std_from_density(
+    cfg: dict,
+    std_key: str,
+    density_key: str,
+    field_name: str,
+    sample_rate_hz: float,
+    default_std: list[float],
+) -> np.ndarray:
+    if std_key in cfg:
+        return _as_float_array(cfg[std_key], f"{field_name}.{std_key}", 3)
+    if density_key in cfg:
+        density = _as_float_array(cfg[density_key], f"{field_name}.{density_key}", 3)
+        return density * np.sqrt(max(float(sample_rate_hz), 0.0) / 2.0)
+    return np.asarray(default_std, dtype=float)
+
+
+def _quat_wxyz_normalized(quat: np.ndarray) -> np.ndarray:
+    normalized = np.asarray(quat, dtype=float).reshape(4)
+    norm = np.linalg.norm(normalized)
+    if norm <= 0.0:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    return normalized / norm
+
+
+def _quat_wxyz_multiply(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = _quat_wxyz_normalized(lhs)
+    w2, x2, y2, z2 = _quat_wxyz_normalized(rhs)
+    return _quat_wxyz_normalized(
+        np.array(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ],
+            dtype=float,
+        )
+    )
+
+
+def _small_angle_quat_wxyz(delta_rad: np.ndarray) -> np.ndarray:
+    delta = np.asarray(delta_rad, dtype=float).reshape(3)
+    angle = np.linalg.norm(delta)
+    if angle <= 1e-12:
+        return _quat_wxyz_normalized(np.array([1.0, 0.5 * delta[0], 0.5 * delta[1], 0.5 * delta[2]], dtype=float))
+    axis = delta / angle
+    half_angle = 0.5 * angle
+    return np.array([np.cos(half_angle), *(np.sin(half_angle) * axis)], dtype=float)
+
+
+def _simulate_imu_measurement(
+    orientation_wxyz: np.ndarray,
+    lin_accel_body: np.ndarray,
+    angular_velocity_body: np.ndarray,
+    imu_cfg: dict,
+    imu_state: dict[str, np.ndarray],
+    rng: np.random.Generator,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[float], list[float], list[float]]:
+    sample_rate_hz = float(imu_cfg.get("frequency_hz", 100.0))
+    noise_cfg = imu_cfg.get("noise", {}) if isinstance(imu_cfg.get("noise", {}), dict) else {}
+    gravity = float(noise_cfg.get("gravity", 9.80665))
+
+    sensor_orientation = np.asarray(
+        quat_wxyz_from_rpy_deg(
+            imu_cfg.get("orientation_rpy_deg", [0.0, 0.0, 0.0]),
+            "sensors.imu.orientation_rpy_deg",
+        ),
+        dtype=float,
+    )
+    sensor_from_body = rotation_matrix_from_quat(sensor_orientation).T
+    sensor_orientation_world = _quat_wxyz_multiply(orientation_wxyz, sensor_orientation)
+
+    accel_body = np.asarray(lin_accel_body, dtype=float)
+    if bool(noise_cfg.get("include_gravity", True)):
+        accel_body = accel_body - (rotation_matrix_from_quat(orientation_wxyz).T @ np.array([0.0, 0.0, -gravity], dtype=float))
+
+    angular_velocity = sensor_from_body @ np.asarray(angular_velocity_body, dtype=float)
+    linear_acceleration = sensor_from_body @ accel_body
+
+    if dt > 0.0 and bool(noise_cfg.get("enable_bias_random_walk", True)):
+        gyro_bias_rw = _as_float_array(
+            noise_cfg.get("gyro_bias_random_walk_rad_s_sqrt_s", [0.0, 0.0, 0.0]),
+            "sensors.imu.noise.gyro_bias_random_walk_rad_s_sqrt_s",
+            3,
+        )
+        accel_bias_rw = _as_float_array(
+            noise_cfg.get("accel_bias_random_walk_m_s2_sqrt_s", [0.0, 0.0, 0.0]),
+            "sensors.imu.noise.accel_bias_random_walk_m_s2_sqrt_s",
+            3,
+        )
+        imu_state["gyro_bias"] += gyro_bias_rw * np.sqrt(dt) * rng.normal(size=3)
+        imu_state["accel_bias"] += accel_bias_rw * np.sqrt(dt) * rng.normal(size=3)
+
+    gyro_std = _vector_noise_std_from_density(
+        noise_cfg,
+        "gyro_noise_std_rad_s",
+        "gyro_noise_density_rad_s_sqrt_hz",
+        "sensors.imu.noise",
+        sample_rate_hz,
+        [0.0, 0.0, 0.0],
+    )
+    accel_std = _vector_noise_std_from_density(
+        noise_cfg,
+        "accel_noise_std_m_s2",
+        "accel_noise_density_m_s2_sqrt_hz",
+        "sensors.imu.noise",
+        sample_rate_hz,
+        [0.0, 0.0, 0.0],
+    )
+    orientation_std_rad = np.deg2rad(
+        _as_float_array(
+            noise_cfg.get("orientation_noise_std_deg", [0.0, 0.0, 0.0]),
+            "sensors.imu.noise.orientation_noise_std_deg",
+            3,
+        )
+    )
+
+    if bool(noise_cfg.get("enable_white_noise", True)):
+        angular_velocity = angular_velocity + imu_state["gyro_bias"] + gyro_std * rng.normal(size=3)
+        linear_acceleration = linear_acceleration + imu_state["accel_bias"] + accel_std * rng.normal(size=3)
+        sensor_orientation_world = _quat_wxyz_multiply(
+            sensor_orientation_world,
+            _small_angle_quat_wxyz(orientation_std_rad * rng.normal(size=3)),
+        )
+
+    gyro_covariance = _diag_covariance(np.maximum(gyro_std, 0.0) ** 2)
+    accel_covariance = _diag_covariance(np.maximum(accel_std, 0.0) ** 2)
+    orientation_covariance = _diag_covariance(np.maximum(orientation_std_rad, 0.0) ** 2)
+    if not bool(noise_cfg.get("publish_orientation", True)):
+        orientation_covariance[0] = -1.0
+
+    return (
+        _quat_wxyz_normalized(sensor_orientation_world),
+        angular_velocity,
+        linear_acceleration,
+        orientation_covariance,
+        gyro_covariance,
+        accel_covariance,
+    )
+
+
+def _magnetometer_vector_t(magnetometer_cfg: dict, microtesla_key: str, tesla_key: str, default_t: list[float]) -> np.ndarray:
+    if microtesla_key in magnetometer_cfg:
+        return _as_float_array(magnetometer_cfg[microtesla_key], f"sensors.magnetometer.{microtesla_key}", 3) * 1e-6
+    return _as_float_array(magnetometer_cfg.get(tesla_key, default_t), f"sensors.magnetometer.{tesla_key}", 3)
+
+
+def _magnetometer_stochastic_noise(
+    stochastic_state: dict[str, np.ndarray],
+    magnetometer_cfg: dict,
+    dt: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if dt <= 0.0:
+        return np.zeros(3, dtype=float)
+
+    n_values = _magnetometer_vector_t(
+        magnetometer_cfg,
+        "random_walk_N_ut_sqrt_s",
+        "random_walk_N_t_sqrt_s",
+        [0.0, 0.0, 0.0],
+    )
+    b_values = _magnetometer_vector_t(
+        magnetometer_cfg,
+        "bias_instability_B_ut_s",
+        "bias_instability_B_t_s",
+        [0.0, 0.0, 0.0],
+    )
+    k_values = _magnetometer_vector_t(
+        magnetometer_cfg,
+        "random_walk_K_ut_sqrt_s3",
+        "random_walk_K_t_sqrt_s3",
+        [0.0, 0.0, 0.0],
+    )
+    corr_times = _as_float_array(magnetometer_cfg.get("correlation_time_s", [1.0, 1.0, 1.0]), "correlation_time_s", 3)
+    use_fixed_random_numbers = bool(magnetometer_cfg.get("use_fixed_random_numbers", False))
+
+    colored_noise = np.zeros(3, dtype=float)
+    for axis in range(3):
+        corr_time = max(float(corr_times[axis]), 1e-9)
+        corr_constant = 1.0 / corr_time
+        s_n = float(n_values[axis]) ** 2
+        s_b = (2.0 * float(b_values[axis]) ** 2 * np.log(2.0)) / (
+            np.pi * 0.4365 * 0.4365 * corr_time
+        )
+        s_k = float(k_values[axis]) ** 2
+
+        q_b = s_b / (2.0 * corr_constant) * (1.0 - np.exp(-2.0 * corr_constant * dt))
+        q_k = s_k * dt
+        q_n = s_n / dt
+
+        random_numbers = np.array([1.0, 2.0, 3.0]) if use_fixed_random_numbers else rng.normal(size=3)
+        z_b = float(stochastic_state["z_b"][axis])
+        z_k = float(stochastic_state["z_k"][axis])
+
+        colored_noise[axis] = z_b + z_k + np.sqrt(max(q_n, 0.0)) * random_numbers[0]
+        stochastic_state["z_b"][axis] = np.exp(-corr_constant * dt) * z_b + np.sqrt(max(q_b, 0.0)) * random_numbers[1]
+        stochastic_state["z_k"][axis] = z_k + np.sqrt(max(q_k, 0.0)) * random_numbers[2]
+        stochastic_state["z_n"][axis] = colored_noise[axis]
+
+    return colored_noise
+
+
+def _simulate_magnetometer_measurement(
+    orientation_wxyz: np.ndarray,
+    magnetometer_cfg: dict,
+    stochastic_state: dict[str, np.ndarray],
+    rng: np.random.Generator,
+    dt: float,
+) -> np.ndarray:
+    local_field_frame = str(magnetometer_cfg.get("local_magnetic_field_frame", "ENU")).strip().upper()
+    if local_field_frame != "ENU":
+        raise ValueError("sensors.magnetometer.local_magnetic_field_frame must be 'ENU'")
+
+    local_field = _magnetometer_vector_t(
+        magnetometer_cfg,
+        "local_magnetic_field_ut",
+        "local_magnetic_field_t",
+        [-4.75537810022174e-06, 17.98356571986e-06, 32.8983169172881e-06],
+    )
+    body_from_world = rotation_matrix_from_quat(orientation_wxyz).T
+    body_field = body_from_world @ local_field
+
+    sensor_orientation = np.asarray(
+        quat_wxyz_from_rpy_deg(
+            magnetometer_cfg.get("orientation_rpy_deg", [0.0, 0.0, 0.0]),
+            "sensors.magnetometer.orientation_rpy_deg",
+        ),
+        dtype=float,
+    )
+    sensor_from_body = rotation_matrix_from_quat(sensor_orientation).T
+    measurement = sensor_from_body @ body_field
+
+    if bool(magnetometer_cfg.get("enable_soft_iron_distortion", False)):
+        soft_iron = _as_float_array(
+            magnetometer_cfg.get("soft_iron_distortion", [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+            "sensors.magnetometer.soft_iron_distortion",
+            9,
+        ).reshape(3, 3)
+        measurement = soft_iron @ measurement
+
+    if bool(magnetometer_cfg.get("enable_hard_iron_bias", False)):
+        measurement = measurement + _magnetometer_vector_t(
+            magnetometer_cfg,
+            "hard_iron_bias_ut",
+            "hard_iron_bias_t",
+            [0.0, 0.0, 0.0],
+        )
+
+    if bool(magnetometer_cfg.get("enable_stochastic_error", True)):
+        measurement = measurement + _magnetometer_stochastic_noise(stochastic_state, magnetometer_cfg, dt, rng)
+
+    if bool(magnetometer_cfg.get("enable_saturation", True)):
+        measurement_range = np.abs(
+            _magnetometer_vector_t(
+                magnetometer_cfg,
+                "measurement_range_ut",
+                "measurement_range_t",
+                [8.0e-04, 8.0e-04, 8.0e-04],
+            )
+        )
+        measurement = np.clip(measurement, -measurement_range, measurement_range)
+
+    if bool(magnetometer_cfg.get("enable_quantization", True)):
+        resolution = _magnetometer_vector_t(
+            magnetometer_cfg,
+            "resolution_ut",
+            "resolution_t",
+            [13.0e-09, 13.0e-09, 13.0e-09],
+        )
+        nonzero_resolution = np.where(np.abs(resolution) > 0.0, resolution, 1.0)
+        measurement = np.round(measurement / nonzero_resolution) * nonzero_resolution
+
+    return measurement
+
+
 def _default_processed_image_topic(raw_topic: str) -> str:
     clean_topic = raw_topic.strip()
     if clean_topic.endswith("/image_raw"):
@@ -320,6 +611,18 @@ def _validate_config(cfg: dict) -> None:
             "sensors.barometer.frequency_hz",
             "sensors.barometer.ros2_topic",
             "sensors.barometer.ros2_frame_id",
+        ],
+    )
+    _require_if_enabled(
+        cfg,
+        "sensors.magnetometer.enabled",
+        [
+            "sensors.magnetometer.translation",
+            "sensors.magnetometer.orientation_rpy_deg",
+            "sensors.magnetometer.frequency_hz",
+            "sensors.magnetometer.ros2_topic",
+            "sensors.magnetometer.ros2_frame_id",
+            "sensors.magnetometer.local_magnetic_field_ut",
         ],
     )
 
@@ -695,6 +998,7 @@ def main() -> None:
     imu_cfg = sensors_cfg["imu"]
     dvl_cfg = sensors_cfg["dvl"]
     baro_cfg = sensors_cfg.get("barometer", {})
+    magnetometer_cfg = sensors_cfg.get("magnetometer", {})
     pose_graph_path = "/ROS2PoseGraph"
     pose_frame_id = robot_prim_path.rsplit("/", 1)[-1] or "base_link"
     pose_topic = str(robot_cfg["pose_topic"]).strip()
@@ -894,6 +1198,18 @@ def main() -> None:
                 ),
             )
         )
+    if bool(magnetometer_cfg.get("enabled", False)):
+        static_tf_specs.append(
+            (
+                "MagnetometerTF",
+                str(magnetometer_cfg["ros2_frame_id"]),
+                vec3(magnetometer_cfg["translation"], "sensors.magnetometer.translation"),
+                quat_wxyz_from_rpy_deg(
+                    magnetometer_cfg["orientation_rpy_deg"],
+                    "sensors.magnetometer.orientation_rpy_deg",
+                ),
+            )
+        )
     for node_name, child_frame_id, translation, orientation_wxyz in static_tf_specs:
         static_tf_nodes_to_create.append((node_name, "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
         static_tf_set_values.extend(
@@ -1028,6 +1344,7 @@ def main() -> None:
 
     baro_enabled = bool(baro_cfg.get("enabled", False))
     baro_pub_node = None
+    baro_publish_impulse_attr = None
     baro_attr_header = None
     baro_attr_frame_id = None
     baro_attr_stamp_sec = None
@@ -1036,6 +1353,19 @@ def main() -> None:
     baro_attr_variance = None
     baro_last_pub_time = -1.0
     baro_period = 0.0
+    baro_rng_seed = baro_cfg.get("random_seed", 11)
+    baro_rng = np.random.default_rng(None if baro_rng_seed is None else int(baro_rng_seed))
+    baro_bias_pa = 0.0
+    if bool(baro_cfg.get("enable_bias", True)):
+        if "bias_pa" in baro_cfg:
+            baro_bias_pa = float(baro_cfg["bias_pa"])
+        else:
+            bias_std_pa = float(baro_cfg.get("bias_std_pa", 0.0))
+            bias_bound_pa = float(baro_cfg.get("absolute_accuracy_pa", 0.0))
+            if bias_std_pa > 0.0:
+                baro_bias_pa = float(baro_rng.normal(0.0, bias_std_pa))
+            elif bias_bound_pa > 0.0:
+                baro_bias_pa = float(baro_rng.uniform(-bias_bound_pa, bias_bound_pa))
     if baro_enabled:
         baro_frequency = float(baro_cfg.get("frequency_hz", 10.0))
         baro_period = 1.0 / baro_frequency if baro_frequency > 0.0 else 0.0
@@ -1044,7 +1374,8 @@ def main() -> None:
             {"graph_path": baro_graph_path, "evaluator_name": "execution"},
             {
                 keys.CREATE_NODES: [
-                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("BarometerPublishImpulse", "omni.graph.action.OnImpulseEvent"),
+                    ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
                     ("PublishBarometer", "isaacsim.ros2.bridge.ROS2Publisher"),
                 ],
                 keys.SET_VALUES: [
@@ -1056,11 +1387,15 @@ def main() -> None:
                     ("PublishBarometer.inputs:queueSize", queue_size),
                 ],
                 keys.CONNECT: [
-                    ("OnPlaybackTick.outputs:tick", "PublishBarometer.inputs:execIn"),
+                    ("BarometerPublishImpulse.outputs:execOut", "PublishBarometer.inputs:execIn"),
+                    ("ROS2Context.outputs:context", "PublishBarometer.inputs:context"),
                 ],
             },
         )
         simulation_app.update()
+        baro_publish_impulse_attr = og.Controller.attribute(
+            f"{baro_graph_path}/BarometerPublishImpulse.state:enableImpulse"
+        )
         baro_pub_node = og.Controller.node(f"{baro_graph_path}/PublishBarometer")
         baro_pub_attrs = {attr.get_name(): attr for attr in baro_pub_node.get_attributes()}
 
@@ -1076,6 +1411,108 @@ def main() -> None:
         baro_attr_stamp_nsec = _baro_find_attr("inputs:header:stamp:nanosec")
         baro_attr_pressure = _baro_find_attr("inputs:fluid_pressure", "inputs:fluidPressure", "inputs:pressure")
         baro_attr_variance = _baro_find_attr("inputs:variance")
+
+    magnetometer_enabled = bool(magnetometer_cfg.get("enabled", False))
+    magnetometer_pub_node = None
+    magnetometer_publish_impulse_attr = None
+    magnetometer_attr_header = None
+    magnetometer_attr_frame_id = None
+    magnetometer_attr_stamp_sec = None
+    magnetometer_attr_stamp_nsec = None
+    magnetometer_attr_field = None
+    magnetometer_attr_field_x = None
+    magnetometer_attr_field_y = None
+    magnetometer_attr_field_z = None
+    magnetometer_attr_covariance = None
+    magnetometer_last_pub_time = -1.0
+    magnetometer_period = 0.0
+    magnetometer_rng_seed = magnetometer_cfg.get("random_seed", 42)
+    magnetometer_rng = np.random.default_rng(None if magnetometer_rng_seed is None else int(magnetometer_rng_seed))
+    magnetometer_stochastic_state = {
+        "z_n": np.zeros(3, dtype=float),
+        "z_b": np.zeros(3, dtype=float),
+        "z_k": np.zeros(3, dtype=float),
+    }
+    if "covariance_ut2" in magnetometer_cfg:
+        magnetometer_covariance = (
+            _as_float_array(
+                magnetometer_cfg["covariance_ut2"],
+                "sensors.magnetometer.covariance_ut2",
+                9,
+            )
+            * 1e-12
+        ).tolist()
+    else:
+        magnetometer_covariance = _as_float_array(
+            magnetometer_cfg.get("covariance_t2", [0.0] * 9),
+            "sensors.magnetometer.covariance_t2",
+            9,
+        ).tolist()
+    if magnetometer_enabled:
+        magnetometer_frequency = float(magnetometer_cfg.get("frequency_hz", 100.0))
+        magnetometer_period = 1.0 / magnetometer_frequency if magnetometer_frequency > 0.0 else 0.0
+        magnetometer_graph_path = "/ROS2MagnetometerGraph"
+        og.Controller.edit(
+            {"graph_path": magnetometer_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: [
+                    ("MagnetometerPublishImpulse", "omni.graph.action.OnImpulseEvent"),
+                    ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                    ("PublishMagnetometer", "isaacsim.ros2.bridge.ROS2Publisher"),
+                ],
+                keys.SET_VALUES: [
+                    ("PublishMagnetometer.inputs:topicName", str(magnetometer_cfg["ros2_topic"])),
+                    ("PublishMagnetometer.inputs:messagePackage", "sensor_msgs"),
+                    ("PublishMagnetometer.inputs:messageSubfolder", "msg"),
+                    ("PublishMagnetometer.inputs:messageName", "MagneticField"),
+                    ("PublishMagnetometer.inputs:nodeNamespace", ros_namespace),
+                    ("PublishMagnetometer.inputs:queueSize", queue_size),
+                ],
+                keys.CONNECT: [
+                    ("MagnetometerPublishImpulse.outputs:execOut", "PublishMagnetometer.inputs:execIn"),
+                    ("ROS2Context.outputs:context", "PublishMagnetometer.inputs:context"),
+                ],
+            },
+        )
+        simulation_app.update()
+        magnetometer_publish_impulse_attr = og.Controller.attribute(
+            f"{magnetometer_graph_path}/MagnetometerPublishImpulse.state:enableImpulse"
+        )
+        magnetometer_pub_node = og.Controller.node(f"{magnetometer_graph_path}/PublishMagnetometer")
+        magnetometer_pub_attrs = {attr.get_name(): attr for attr in magnetometer_pub_node.get_attributes()}
+
+        def _magnetometer_find_attr(*names: str):
+            for name in names:
+                if name in magnetometer_pub_attrs:
+                    return magnetometer_pub_attrs[name]
+            return None
+
+        magnetometer_attr_header = _magnetometer_find_attr("inputs:header")
+        magnetometer_attr_frame_id = _magnetometer_find_attr(
+            "inputs:header:frame_id",
+            "inputs:header:frameId",
+            "inputs:frameId",
+        )
+        magnetometer_attr_stamp_sec = _magnetometer_find_attr("inputs:header:stamp:sec")
+        magnetometer_attr_stamp_nsec = _magnetometer_find_attr("inputs:header:stamp:nanosec")
+        magnetometer_attr_field = _magnetometer_find_attr("inputs:magnetic_field", "inputs:magneticField")
+        magnetometer_attr_field_x = _magnetometer_find_attr(
+            "inputs:magnetic_field:x",
+            "inputs:magneticField:x",
+        )
+        magnetometer_attr_field_y = _magnetometer_find_attr(
+            "inputs:magnetic_field:y",
+            "inputs:magneticField:y",
+        )
+        magnetometer_attr_field_z = _magnetometer_find_attr(
+            "inputs:magnetic_field:z",
+            "inputs:magneticField:z",
+        )
+        magnetometer_attr_covariance = _magnetometer_find_attr(
+            "inputs:magnetic_field_covariance",
+            "inputs:magneticFieldCovariance",
+            "inputs:covariance",
+        )
 
     # 5) Attach IMU and publish to ROS2.
     if not bool(imu_cfg["enabled"]):
@@ -1096,37 +1533,84 @@ def main() -> None:
         orientation_wxyz=quat_wxyz_from_rpy_deg(imu_cfg["orientation_rpy_deg"], "sensors.imu.orientation_rpy_deg"),
     )
 
+    imu_period = 1.0 / float(imu_cfg["frequency_hz"]) if float(imu_cfg["frequency_hz"]) > 0.0 else 0.0
+    imu_last_pub_time = -1.0
+    imu_rng_seed = imu_cfg.get("random_seed", 7)
+    imu_rng = np.random.default_rng(None if imu_rng_seed is None else int(imu_rng_seed))
+    imu_noise_cfg = imu_cfg.get("noise", {}) if isinstance(imu_cfg.get("noise", {}), dict) else {}
+    imu_state = {
+        "gyro_bias": _as_float_array(
+            imu_noise_cfg.get("gyro_bias_rad_s", [0.0, 0.0, 0.0]),
+            "sensors.imu.noise.gyro_bias_rad_s",
+            3,
+        ),
+        "accel_bias": _as_float_array(
+            imu_noise_cfg.get("accel_bias_m_s2", [0.0, 0.0, 0.0]),
+            "sensors.imu.noise.accel_bias_m_s2",
+            3,
+        ),
+    }
+
     imu_graph_path = "/ROS2IMUGraph"
     og.Controller.edit(
         {"graph_path": imu_graph_path, "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
                 ("IMUPublishImpulse", "omni.graph.action.OnImpulseEvent"),
-                ("ReadIMU", "isaacsim.sensors.physics.IsaacReadIMU"),
-                ("PublishImu", "isaacsim.ros2.bridge.ROS2PublishImu"),
+                ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("PublishImu", "isaacsim.ros2.bridge.ROS2Publisher"),
             ],
             keys.SET_VALUES: [
-                ("ReadIMU.inputs:imuPrim", [usdrt.Sdf.Path(imu_prim_path)]),
                 ("PublishImu.inputs:topicName", str(imu_cfg["ros2_topic"])),
-                ("PublishImu.inputs:frameId", str(imu_cfg["ros2_frame_id"])),
+                ("PublishImu.inputs:messagePackage", "sensor_msgs"),
+                ("PublishImu.inputs:messageSubfolder", "msg"),
+                ("PublishImu.inputs:messageName", "Imu"),
                 ("PublishImu.inputs:nodeNamespace", ros_namespace),
                 ("PublishImu.inputs:queueSize", queue_size),
-                ("PublishImu.inputs:publishAngularVelocity", True),
-                ("PublishImu.inputs:publishLinearAcceleration", True),
-                ("PublishImu.inputs:publishOrientation", True),
             ],
             keys.CONNECT: [
-                ("IMUPublishImpulse.outputs:execOut", "ReadIMU.inputs:execIn"),
-                ("ReadIMU.outputs:execOut", "PublishImu.inputs:execIn"),
-                ("ReadIMU.outputs:angVel", "PublishImu.inputs:angularVelocity"),
-                ("ReadIMU.outputs:linAcc", "PublishImu.inputs:linearAcceleration"),
-                ("ReadIMU.outputs:orientation", "PublishImu.inputs:orientation"),
-                ("ReadIMU.outputs:sensorTime", "PublishImu.inputs:timeStamp"),
+                ("IMUPublishImpulse.outputs:execOut", "PublishImu.inputs:execIn"),
+                ("ROS2Context.outputs:context", "PublishImu.inputs:context"),
             ],
         },
     )
     simulation_app.update()
     imu_publish_impulse_attr = og.Controller.attribute(f"{imu_graph_path}/IMUPublishImpulse.state:enableImpulse")
+    imu_pub_node = og.Controller.node(f"{imu_graph_path}/PublishImu")
+    imu_pub_attrs = {attr.get_name(): attr for attr in imu_pub_node.get_attributes()}
+
+    def _imu_find_attr(*names: str):
+        for name in names:
+            if name in imu_pub_attrs:
+                return imu_pub_attrs[name]
+        return None
+
+    imu_attr_header = _imu_find_attr("inputs:header")
+    imu_attr_frame_id = _imu_find_attr("inputs:header:frame_id", "inputs:header:frameId", "inputs:frameId")
+    imu_attr_stamp_sec = _imu_find_attr("inputs:header:stamp:sec")
+    imu_attr_stamp_nsec = _imu_find_attr("inputs:header:stamp:nanosec")
+    imu_attr_orientation = _imu_find_attr("inputs:orientation")
+    imu_attr_orientation_x = _imu_find_attr("inputs:orientation:x")
+    imu_attr_orientation_y = _imu_find_attr("inputs:orientation:y")
+    imu_attr_orientation_z = _imu_find_attr("inputs:orientation:z")
+    imu_attr_orientation_w = _imu_find_attr("inputs:orientation:w")
+    imu_attr_angular_velocity = _imu_find_attr("inputs:angular_velocity", "inputs:angularVelocity")
+    imu_attr_angular_velocity_x = _imu_find_attr("inputs:angular_velocity:x", "inputs:angularVelocity:x")
+    imu_attr_angular_velocity_y = _imu_find_attr("inputs:angular_velocity:y", "inputs:angularVelocity:y")
+    imu_attr_angular_velocity_z = _imu_find_attr("inputs:angular_velocity:z", "inputs:angularVelocity:z")
+    imu_attr_linear_acceleration = _imu_find_attr("inputs:linear_acceleration", "inputs:linearAcceleration")
+    imu_attr_linear_acceleration_x = _imu_find_attr("inputs:linear_acceleration:x", "inputs:linearAcceleration:x")
+    imu_attr_linear_acceleration_y = _imu_find_attr("inputs:linear_acceleration:y", "inputs:linearAcceleration:y")
+    imu_attr_linear_acceleration_z = _imu_find_attr("inputs:linear_acceleration:z", "inputs:linearAcceleration:z")
+    imu_attr_orientation_covariance = _imu_find_attr("inputs:orientation_covariance", "inputs:orientationCovariance")
+    imu_attr_angular_velocity_covariance = _imu_find_attr(
+        "inputs:angular_velocity_covariance",
+        "inputs:angularVelocityCovariance",
+    )
+    imu_attr_linear_acceleration_covariance = _imu_find_attr(
+        "inputs:linear_acceleration_covariance",
+        "inputs:linearAccelerationCovariance",
+    )
 
     # 5) Attach OceanSim DVL and publish to ROS2 TwistWithCovarianceStamped topic.
     if not bool(dvl_cfg["enabled"]):
@@ -1144,6 +1628,7 @@ def main() -> None:
         depth_cov=float(dvl_cfg.get("depth_cov", 0.0)),
         min_range=float(dvl_cfg.get("min_range_m", 0.1)),
         max_range=float(dvl_cfg.get("max_range_m", 100.0)),
+        num_beams_out_range_threshold=int(dvl_cfg.get("beam_dropout_threshold", 2)),
         freq=float(dvl_cfg["frequency_hz"]),
     )
     dvl_sensor.attachDVL(
@@ -1154,6 +1639,16 @@ def main() -> None:
 
     dvl_require_bottom_lock = bool(dvl_cfg.get("require_bottom_lock", True))
     dvl_beam_dropout_threshold = int(dvl_cfg.get("beam_dropout_threshold", 2))
+    dvl_rng_seed = dvl_cfg.get("random_seed", 13)
+    dvl_rng = np.random.default_rng(None if dvl_rng_seed is None else int(dvl_rng_seed))
+    dvl_random_dropout_probability = float(dvl_cfg.get("random_dropout_probability", 0.0))
+    dvl_range_dropout_start_m = float(dvl_cfg.get("range_dropout_start_m", dvl_cfg.get("max_range_m", 50.0)))
+    dvl_range_dropout_full_m = float(dvl_cfg.get("range_dropout_full_m", dvl_cfg.get("max_range_m", 50.0)))
+    dvl_range_dropout_probability = float(dvl_cfg.get("range_dropout_probability", 0.0))
+    dvl_min_dropout_duration_s = max(0.0, float(dvl_cfg.get("min_dropout_duration_s", 0.0)))
+    dvl_forced_dropout_interval_s = max(0.0, float(dvl_cfg.get("forced_dropout_interval_s", 0.0)))
+    dvl_dropout_until_time = -1.0
+    dvl_last_dropout_start_time = 0.0
     dvl_translation_body = np.asarray(vec3(dvl_cfg["translation"], "sensors.dvl.translation"), dtype=float)
     dvl_orientation_wxyz = np.asarray(
         quat_wxyz_from_rpy_deg(dvl_cfg["orientation_rpy_deg"], "sensors.dvl.orientation_rpy_deg"),
@@ -1222,9 +1717,35 @@ def main() -> None:
     dvl_attr_angular_z = _dvl_find_attr("inputs:twist:twist:angular:z", "inputs:twist:angular:z")
     dvl_attr_covariance = _dvl_find_attr("inputs:twist:covariance", "inputs:covariance")
     dvl_twist_covariance = [0.0] * 36
-    dvl_linear_cov = float(dvl_cfg.get("vel_cov", 0.0))
-    for diagonal_idx in (0, 7, 14):
-        dvl_twist_covariance[diagonal_idx] = dvl_linear_cov
+    dvl_beam_cov = max(0.0, float(dvl_cfg.get("vel_cov", 0.0)))
+    dvl_elevation_rad = np.deg2rad(float(dvl_cfg.get("elevation_deg", 22.5)))
+    sin_elevation = np.sin(dvl_elevation_rad)
+    cos_elevation = np.cos(dvl_elevation_rad)
+    if abs(sin_elevation) <= 1e-9 or abs(cos_elevation) <= 1e-9:
+        raise ValueError("sensors.dvl.elevation_deg produces a singular Janus reconstruction")
+    dvl_beam_to_body = np.array(
+        [
+            [1.0 / (2.0 * sin_elevation), 0.0, -1.0 / (2.0 * sin_elevation), 0.0],
+            [0.0, 1.0 / (2.0 * sin_elevation), 0.0, -1.0 / (2.0 * sin_elevation)],
+            [
+                1.0 / (4.0 * cos_elevation),
+                1.0 / (4.0 * cos_elevation),
+                1.0 / (4.0 * cos_elevation),
+                1.0 / (4.0 * cos_elevation),
+            ],
+        ],
+        dtype=float,
+    )
+    dvl_linear_cov_body = dvl_beam_cov * (dvl_beam_to_body @ dvl_beam_to_body.T)
+    dvl_rotation_sensor_from_body = dvl_rotation_body_from_sensor.T
+    dvl_linear_cov_sensor = (
+        dvl_rotation_sensor_from_body
+        @ dvl_linear_cov_body
+        @ dvl_rotation_sensor_from_body.T
+    )
+    for row in range(3):
+        for col in range(3):
+            dvl_twist_covariance[row * 6 + col] = float(dvl_linear_cov_sensor[row, col])
     def _split_ros_time(sim_time: float) -> tuple[int, int]:
         sec = int(sim_time)
         nanosec = int(round((sim_time - sec) * 1e9))
@@ -1303,11 +1824,13 @@ def main() -> None:
 
     def _on_physics_step(_step_size: float) -> None:
         nonlocal baro_last_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag, sim_time_seconds
+        nonlocal dvl_dropout_until_time, dvl_last_dropout_start_time
+        nonlocal imu_last_pub_time, magnetometer_last_pub_time
         start_time = time.perf_counter()
         try:
             sim_time_seconds += float(_step_size)
-            if imu_publish_impulse_attr is not None:
-                imu_publish_impulse_attr.set(True)
+            if dvl_publish_impulse_attr is not None:
+                dvl_publish_impulse_attr.set(False)
             state = _read_state()
             if state is None:
                 return
@@ -1389,8 +1912,15 @@ def main() -> None:
                     fluid_density = float(baro_cfg.get("fluid_density", 1025.0))
                     gravity = float(baro_cfg.get("gravity", 9.80665))
                     surface_pressure = float(baro_cfg.get("surface_pressure", 101325.0))
-                    pressure = surface_pressure + fluid_density * gravity * depth
-                    variance = float(baro_cfg.get("variance", 0.0))
+                    pressure_ideal = surface_pressure + fluid_density * gravity * depth
+                    noise_std_pa = float(baro_cfg.get("noise_std_pa", 0.0))
+                    quantization_pa = float(baro_cfg.get("resolution_pa", 0.0))
+                    pressure = pressure_ideal + baro_bias_pa
+                    if bool(baro_cfg.get("enable_white_noise", True)) and noise_std_pa > 0.0:
+                        pressure += float(baro_rng.normal(0.0, noise_std_pa))
+                    if bool(baro_cfg.get("enable_quantization", True)) and quantization_pa > 0.0:
+                        pressure = round(pressure / quantization_pa) * quantization_pa
+                    variance = float(baro_cfg.get("variance", noise_std_pa * noise_std_pa))
                     if baro_attr_header is not None:
                         baro_attr_header.set(
                             json.dumps(
@@ -1410,18 +1940,111 @@ def main() -> None:
                         baro_attr_pressure.set(float(pressure))
                     if baro_attr_variance is not None:
                         baro_attr_variance.set(float(variance))
+                    if baro_publish_impulse_attr is not None:
+                        baro_publish_impulse_attr.set(True)
+            if magnetometer_enabled and magnetometer_pub_node is not None:
+                sim_time = sim_time_seconds
+                if (
+                    magnetometer_period <= 0.0
+                    or magnetometer_last_pub_time < 0.0
+                    or (sim_time - magnetometer_last_pub_time) >= magnetometer_period
+                ):
+                    magnetometer_last_pub_time = sim_time
+                    sec, nanosec = _split_ros_time(sim_time)
+                    magnetic_field = _simulate_magnetometer_measurement(
+                        orientation_wxyz=q,
+                        magnetometer_cfg=magnetometer_cfg,
+                        stochastic_state=magnetometer_stochastic_state,
+                        rng=magnetometer_rng,
+                        dt=magnetometer_period if magnetometer_period > 0.0 else float(_step_size),
+                    )
+                    if magnetometer_attr_header is not None:
+                        magnetometer_attr_header.set(
+                            json.dumps(
+                                {
+                                    "frame_id": str(magnetometer_cfg["ros2_frame_id"]),
+                                    "stamp": {"sec": sec, "nanosec": nanosec},
+                                }
+                            )
+                        )
+                    if magnetometer_attr_frame_id is not None:
+                        magnetometer_attr_frame_id.set(str(magnetometer_cfg["ros2_frame_id"]))
+                    if magnetometer_attr_stamp_sec is not None:
+                        magnetometer_attr_stamp_sec.set(sec)
+                    if magnetometer_attr_stamp_nsec is not None:
+                        magnetometer_attr_stamp_nsec.set(nanosec)
+                    if magnetometer_attr_field is not None:
+                        try:
+                            magnetometer_attr_field.set(
+                                [float(magnetic_field[0]), float(magnetic_field[1]), float(magnetic_field[2])]
+                            )
+                        except Exception:
+                            magnetometer_attr_field.set(
+                                json.dumps(
+                                    {
+                                        "x": float(magnetic_field[0]),
+                                        "y": float(magnetic_field[1]),
+                                        "z": float(magnetic_field[2]),
+                                    }
+                                )
+                            )
+                    else:
+                        if magnetometer_attr_field_x is not None:
+                            magnetometer_attr_field_x.set(float(magnetic_field[0]))
+                        if magnetometer_attr_field_y is not None:
+                            magnetometer_attr_field_y.set(float(magnetic_field[1]))
+                        if magnetometer_attr_field_z is not None:
+                            magnetometer_attr_field_z.set(float(magnetic_field[2]))
+                    if magnetometer_attr_covariance is not None:
+                        magnetometer_attr_covariance.set(magnetometer_covariance)
+                    if magnetometer_publish_impulse_attr is not None:
+                        magnetometer_publish_impulse_attr.set(True)
             dvl_velocity_sample = dvl_sensor.get_linear_vel_fd(physics_dt=float(_step_size))
             if isinstance(dvl_velocity_sample, np.ndarray) and dvl_velocity_sample.shape[0] >= 3:
+                sim_time = sim_time_seconds
                 beam_hits = None
-                if dvl_require_bottom_lock:
+                dvl_random_drop = False
+                try:
+                    beam_hits = [bool(hit) for hit in dvl_sensor.get_beam_hit()]
+                except Exception:
+                    beam_hits = None
+                dvl_beam_dropout = beam_hits is not None and beam_hits.count(False) >= dvl_beam_dropout_threshold
+                dvl_valid_bottom_lock = beam_hits is not None and not dvl_beam_dropout
+                dvl_dropout_probability = max(0.0, min(1.0, dvl_random_dropout_probability))
+                if dvl_range_dropout_probability > 0.0:
                     try:
-                        beam_hits = [bool(hit) for hit in dvl_sensor.get_beam_hit()]
+                        ranges = np.asarray(dvl_sensor.get_depth(), dtype=float)
+                        finite_ranges = ranges[np.isfinite(ranges)]
+                        if finite_ranges.size > 0:
+                            altitude = float(np.min(finite_ranges))
+                            if altitude >= dvl_range_dropout_start_m:
+                                denom = max(dvl_range_dropout_full_m - dvl_range_dropout_start_m, 1e-9)
+                                range_fraction = max(0.0, min(1.0, (altitude - dvl_range_dropout_start_m) / denom))
+                                dvl_dropout_probability = max(
+                                    dvl_dropout_probability,
+                                    range_fraction * max(0.0, min(1.0, dvl_range_dropout_probability)),
+                                )
                     except Exception:
-                        beam_hits = None
-                if (not dvl_require_bottom_lock) or (
-                    beam_hits is not None and beam_hits.count(False) < dvl_beam_dropout_threshold
+                        pass
+                if dvl_dropout_probability > 0.0:
+                    dvl_random_drop = bool(dvl_rng.random() < dvl_dropout_probability)
+                dvl_bottom_lock_drop = (
+                    (not dvl_require_bottom_lock and dvl_beam_dropout)
+                    or (dvl_require_bottom_lock and not dvl_valid_bottom_lock)
+                )
+                dvl_forced_drop = (
+                    dvl_forced_dropout_interval_s > 0.0
+                    and (sim_time - dvl_last_dropout_start_time) >= dvl_forced_dropout_interval_s
+                )
+                dvl_drop_triggered = dvl_random_drop or dvl_bottom_lock_drop or dvl_forced_drop
+                if dvl_drop_triggered and sim_time >= dvl_dropout_until_time:
+                    dvl_last_dropout_start_time = sim_time
+                    dvl_dropout_until_time = sim_time + dvl_min_dropout_duration_s
+                dvl_drop_active = sim_time < dvl_dropout_until_time
+                if (not dvl_drop_active) and (
+                    (not dvl_require_bottom_lock and not dvl_beam_dropout)
+                    or (dvl_require_bottom_lock and dvl_valid_bottom_lock)
                 ):
-                    sim_time = sim_time_seconds
                     sec, nanosec = _split_ros_time(sim_time)
                     body_rotation = rotation_matrix_from_quat(q)
                     angular_velocity_body = body_rotation.T @ ang_world
@@ -1505,6 +2128,128 @@ def main() -> None:
             pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
                 pos, q, lin_world, ang_world
             )
+            sim_time = sim_time_seconds
+            if imu_period <= 0.0 or imu_last_pub_time < 0.0 or (sim_time - imu_last_pub_time) >= imu_period:
+                imu_last_pub_time = sim_time
+                sec, nanosec = _split_ros_time(sim_time)
+                (
+                    imu_orientation_wxyz,
+                    imu_angular_velocity,
+                    imu_linear_acceleration,
+                    imu_orientation_covariance,
+                    imu_angular_velocity_covariance,
+                    imu_linear_acceleration_covariance,
+                ) = _simulate_imu_measurement(
+                    orientation_wxyz=q,
+                    lin_accel_body=lin_accel_body,
+                    angular_velocity_body=v_body[3:],
+                    imu_cfg=imu_cfg,
+                    imu_state=imu_state,
+                    rng=imu_rng,
+                    dt=imu_period if imu_period > 0.0 else float(_step_size),
+                )
+                imu_orientation_xyzw = [
+                    float(imu_orientation_wxyz[1]),
+                    float(imu_orientation_wxyz[2]),
+                    float(imu_orientation_wxyz[3]),
+                    float(imu_orientation_wxyz[0]),
+                ]
+                imu_angular_velocity_values = [
+                    float(imu_angular_velocity[0]),
+                    float(imu_angular_velocity[1]),
+                    float(imu_angular_velocity[2]),
+                ]
+                imu_linear_acceleration_values = [
+                    float(imu_linear_acceleration[0]),
+                    float(imu_linear_acceleration[1]),
+                    float(imu_linear_acceleration[2]),
+                ]
+                if imu_attr_header is not None:
+                    imu_attr_header.set(
+                        json.dumps(
+                            {
+                                "frame_id": str(imu_cfg["ros2_frame_id"]),
+                                "stamp": {"sec": sec, "nanosec": nanosec},
+                            }
+                        )
+                    )
+                if imu_attr_frame_id is not None:
+                    imu_attr_frame_id.set(str(imu_cfg["ros2_frame_id"]))
+                if imu_attr_stamp_sec is not None:
+                    imu_attr_stamp_sec.set(sec)
+                if imu_attr_stamp_nsec is not None:
+                    imu_attr_stamp_nsec.set(nanosec)
+                if imu_attr_orientation is not None:
+                    try:
+                        imu_attr_orientation.set(imu_orientation_xyzw)
+                    except Exception:
+                        imu_attr_orientation.set(
+                            json.dumps(
+                                {
+                                    "x": imu_orientation_xyzw[0],
+                                    "y": imu_orientation_xyzw[1],
+                                    "z": imu_orientation_xyzw[2],
+                                    "w": imu_orientation_xyzw[3],
+                                }
+                            )
+                        )
+                else:
+                    if imu_attr_orientation_x is not None:
+                        imu_attr_orientation_x.set(imu_orientation_xyzw[0])
+                    if imu_attr_orientation_y is not None:
+                        imu_attr_orientation_y.set(imu_orientation_xyzw[1])
+                    if imu_attr_orientation_z is not None:
+                        imu_attr_orientation_z.set(imu_orientation_xyzw[2])
+                    if imu_attr_orientation_w is not None:
+                        imu_attr_orientation_w.set(imu_orientation_xyzw[3])
+                if imu_attr_angular_velocity is not None:
+                    try:
+                        imu_attr_angular_velocity.set(imu_angular_velocity_values)
+                    except Exception:
+                        imu_attr_angular_velocity.set(
+                            json.dumps(
+                                {
+                                    "x": imu_angular_velocity_values[0],
+                                    "y": imu_angular_velocity_values[1],
+                                    "z": imu_angular_velocity_values[2],
+                                }
+                            )
+                        )
+                else:
+                    if imu_attr_angular_velocity_x is not None:
+                        imu_attr_angular_velocity_x.set(imu_angular_velocity_values[0])
+                    if imu_attr_angular_velocity_y is not None:
+                        imu_attr_angular_velocity_y.set(imu_angular_velocity_values[1])
+                    if imu_attr_angular_velocity_z is not None:
+                        imu_attr_angular_velocity_z.set(imu_angular_velocity_values[2])
+                if imu_attr_linear_acceleration is not None:
+                    try:
+                        imu_attr_linear_acceleration.set(imu_linear_acceleration_values)
+                    except Exception:
+                        imu_attr_linear_acceleration.set(
+                            json.dumps(
+                                {
+                                    "x": imu_linear_acceleration_values[0],
+                                    "y": imu_linear_acceleration_values[1],
+                                    "z": imu_linear_acceleration_values[2],
+                                }
+                            )
+                        )
+                else:
+                    if imu_attr_linear_acceleration_x is not None:
+                        imu_attr_linear_acceleration_x.set(imu_linear_acceleration_values[0])
+                    if imu_attr_linear_acceleration_y is not None:
+                        imu_attr_linear_acceleration_y.set(imu_linear_acceleration_values[1])
+                    if imu_attr_linear_acceleration_z is not None:
+                        imu_attr_linear_acceleration_z.set(imu_linear_acceleration_values[2])
+                if imu_attr_orientation_covariance is not None:
+                    imu_attr_orientation_covariance.set(imu_orientation_covariance)
+                if imu_attr_angular_velocity_covariance is not None:
+                    imu_attr_angular_velocity_covariance.set(imu_angular_velocity_covariance)
+                if imu_attr_linear_acceleration_covariance is not None:
+                    imu_attr_linear_acceleration_covariance.set(imu_linear_acceleration_covariance)
+                if imu_publish_impulse_attr is not None:
+                    imu_publish_impulse_attr.set(True)
             if velocity_attr_twist is not None:
                 velocity_attr_twist.set(
                     json.dumps(

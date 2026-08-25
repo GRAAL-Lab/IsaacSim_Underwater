@@ -11,6 +11,7 @@ IsaacSim Underwater is a GPU-accelerated underwater robotics simulation in NVIDI
 5. DVL (Waterlinked A50, OceanSim model)
 6. Barometer (OceanSim model)
 7. IMU (Isaac Sim physics IMU)
+8. Magnetometer (PNI RM3100-style model)
 
 ---
 
@@ -286,12 +287,18 @@ The script sets up ROS2 graphs for:
 - **OceanSim 2D imaging sonar** (raw `sensor_msgs/Image`):
   - `sensors.imaging_sonar.ros2_topic` (default: `/IsaacSim/imaging_sonar/image_raw`)
   - `sensors.imaging_sonar.ros2_frame_id` (default: `imaging_sonar_link`)
-- **3D sonar* (`sensor_msgs/PointCloud2`):
+- **3D sonar** (`sensor_msgs/PointCloud2`):
   - `sensors.rtx_lidar.ros2_topic` (default: `/IsaacSim/rtx_lidar/point_cloud`)
   - `sensors.rtx_lidar.ros2_frame_id` (default: `rtx_lidar_link`)
 - **IMU** (sensor_msgs/Imu): `sensors.imu.ros2_topic` (default: `/IsaacSim/imu`)
+  - The simulator publishes a noisy IMU model using body kinematics plus gravity, configurable gyro/accelerometer noise density, bias random walk, orientation perturbation, and covariance fields. The default values are based on the Blue Robotics Navigator ICM-20602-style IMU.
+- **Magnetometer** (`sensor_msgs/msg/MagneticField`): `sensors.magnetometer.ros2_topic` (default: `/auv/imu/magnetic_field`)
+  - The model rotates a configured ENU local magnetic field into the sensor frame and can apply hard iron bias, soft iron distortion, colored stochastic errors, saturation, and quantization.
+  - Magnetometer config values use microtesla (`*_ut`) and microtesla-squared (`*_ut2`) for readability; the ROS message is published in Tesla as required by `sensor_msgs/msg/MagneticField`.
 - **DVL** (`geometry_msgs/TwistWithCovarianceStamped`): `sensors.dvl.ros2_topic` (default: `/auv/dvl`)
-  - The DVL comes from **OceanSim**.
+  - The DVL comes from **OceanSim** and uses OceanSim beam covariance for Gaussian velocity/range noise plus optional random and range-dependent dropout. The default values are tuned to a Water Linked A50-style setup.
+- **Pressure** (`sensor_msgs/FluidPressure`): `sensors.barometer.ros2_topic` (default: `/auv/pressure/scaled2`)
+  - The pressure model computes hydrostatic pressure from depth, then applies a run-level pressure bias, white pressure noise, quantization, and message variance.
 
 ### 2D imaging sonar
 The simulation also supports OceanSim’s **2D imaging sonar** through `ImagingSonarSensor`. This is different from the 3D sonar definition embedded in the USD scene.
@@ -416,12 +423,16 @@ Notable keys:
 - `map.usd_path`: USD stage to load (relative paths resolve relative to repo root)
 - `robot.prim_path`: embedded prim path inside the USD
 - `simulation.timing.physics_hz`, `simulation.timing.render_fps`
-- `sensors.*`: camera, DVL, IMU configuration (poses + ROS topics)
+- `sensors.*`: camera, DVL, IMU, magnetometer configuration (poses + ROS topics)
 - `sensors.uw_camera.uw_effects`: OceanSim underwater attenuation/backscatter parameters
 - `sensors.uw_camera.ros2_processed_topic`: processed underwater image topic
 - `sensors.imaging_sonar.*`: OceanSim 2D imaging sonar pose, processing, and ROS topic
   - includes stream sizing via `stream_width` / `stream_height`
   - includes stability/performance mode via `fetch_on_device`
+- `sensors.dvl.*`: Water Linked A50-style beam geometry, altitude limits, velocity/range covariance, bottom-lock checks, and random/range-dependent dropout
+- `sensors.imu.noise.*`: Blue Robotics Navigator ICM-20602-style gyro/accelerometer white noise densities, bias random walk, gravity inclusion, orientation noise, and covariance publishing
+- `sensors.magnetometer.*`: local ENU magnetic field vector, Blue Robotics Navigator/MMC5983MA-style report rate/range/resolution/noise settings, hard/soft iron settings, saturation, quantization, and ROS topic
+- `sensors.barometer.*`: Bar30/MS5837-30BA-style hydrostatic pressure, absolute-accuracy bias, pressure resolution noise, quantization, and ROS topic
 - `mvm.config_path`: libconfig file for vehicle parameters (default: `config/BlueROV.conf`)
 
 ---
