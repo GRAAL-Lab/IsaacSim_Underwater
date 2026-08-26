@@ -622,6 +622,7 @@ def _validate_config(cfg: dict) -> None:
         "sensors.dvl.orientation_rpy_deg",
         "sensors.dvl.frequency_hz",
         "sensors.dvl.ros2_topic",
+        "sensors.dvl.ros2_altitude_topic",
         "sensors.dvl.ros2_frame_id",
         "sensors.imu.enabled",
         "sensors.imu.prim_path",
@@ -704,6 +705,10 @@ def main() -> None:
     sim_cfg = cfg["simulation"]
     sensors_cfg = cfg["sensors"]
     mvm_cfg = cfg["mvm"]
+    diagnostics_cfg = sim_cfg.get("diagnostics", {})
+    if not isinstance(diagnostics_cfg, dict):
+        raise ValueError("simulation.diagnostics must be an object")
+    log_sensor_rates = bool(diagnostics_cfg.get("log_sensor_rates", False))
 
     from isaacsim import SimulationApp
 
@@ -1826,7 +1831,7 @@ def main() -> None:
         "inputs:linearAccelerationCovariance",
     )
 
-    # 5) Attach OceanSim DVL and publish to ROS2 TwistWithCovarianceStamped topic.
+    # 5) Attach OceanSim DVL and publish bottom-track velocity and altitude.
     if not bool(dvl_cfg["enabled"]):
         raise RuntimeError("sensors.dvl.enabled must be true")
 
@@ -1889,6 +1894,7 @@ def main() -> None:
                 ("DVLPublishImpulse", "omni.graph.action.OnImpulseEvent"),
                 ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
                 ("PublishDVL", "isaacsim.ros2.bridge.ROS2Publisher"),
+                ("PublishDVLAltitude", "isaacsim.ros2.bridge.ROS2Publisher"),
             ],
             keys.SET_VALUES: [
                 ("PublishDVL.inputs:topicName", str(dvl_cfg["ros2_topic"])),
@@ -1898,10 +1904,19 @@ def main() -> None:
                 ("PublishDVL.inputs:nodeNamespace", ros_namespace),
                 ("PublishDVL.inputs:qosProfile", dvl_sensor_qos_profile),
                 ("PublishDVL.inputs:queueSize", queue_size),
+                ("PublishDVLAltitude.inputs:topicName", str(dvl_cfg["ros2_altitude_topic"])),
+                ("PublishDVLAltitude.inputs:messagePackage", "std_msgs"),
+                ("PublishDVLAltitude.inputs:messageSubfolder", "msg"),
+                ("PublishDVLAltitude.inputs:messageName", "Float64"),
+                ("PublishDVLAltitude.inputs:nodeNamespace", ros_namespace),
+                ("PublishDVLAltitude.inputs:qosProfile", dvl_sensor_qos_profile),
+                ("PublishDVLAltitude.inputs:queueSize", queue_size),
             ],
             keys.CONNECT: [
                 ("DVLPublishImpulse.outputs:execOut", "PublishDVL.inputs:execIn"),
+                ("DVLPublishImpulse.outputs:execOut", "PublishDVLAltitude.inputs:execIn"),
                 ("ROS2Context.outputs:context", "PublishDVL.inputs:context"),
+                ("ROS2Context.outputs:context", "PublishDVLAltitude.inputs:context"),
             ],
         },
     )
@@ -1909,8 +1924,10 @@ def main() -> None:
     dvl_graph = og.Controller.graph(dvl_graph_path)
     dvl_graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
     dvl_pub_node = og.Controller.node(f"{dvl_graph_path}/PublishDVL")
+    dvl_altitude_pub_node = og.Controller.node(f"{dvl_graph_path}/PublishDVLAltitude")
     dvl_publish_impulse_attr = og.Controller.attribute(f"{dvl_graph_path}/DVLPublishImpulse.state:enableImpulse")
     dvl_pub_attrs = {attr.get_name(): attr for attr in dvl_pub_node.get_attributes()}
+    dvl_altitude_pub_attrs = {attr.get_name(): attr for attr in dvl_altitude_pub_node.get_attributes()}
     def _dvl_find_attr(*names: str):
         for name in names:
             if name in dvl_pub_attrs:
@@ -1932,6 +1949,9 @@ def main() -> None:
     dvl_attr_angular_y = _dvl_find_attr("inputs:twist:twist:angular:y", "inputs:twist:angular:y")
     dvl_attr_angular_z = _dvl_find_attr("inputs:twist:twist:angular:z", "inputs:twist:angular:z")
     dvl_attr_covariance = _dvl_find_attr("inputs:twist:covariance", "inputs:covariance")
+    dvl_altitude_attr_data = dvl_altitude_pub_attrs.get("inputs:data")
+    if dvl_altitude_attr_data is None:
+        raise RuntimeError("ROS2 DVL altitude publisher does not expose the std_msgs/Float64 data field")
     dvl_twist_covariance = [0.0] * 36
     dvl_beam_cov = max(0.0, float(dvl_cfg.get("vel_cov", 0.0)))
     dvl_elevation_rad = np.deg2rad(float(dvl_cfg.get("elevation_deg", 22.5)))
@@ -2040,6 +2060,7 @@ def main() -> None:
         "magnetometer": 0,
         "dvl_samples": 0,
         "dvl_messages": 0,
+        "dvl_altitude_messages": 0,
         "dvl_dropouts": 0,
         "imu": 0,
         "camera_processed": 0,
@@ -2236,6 +2257,7 @@ def main() -> None:
                 sensor_publish_counts["dvl_samples"] += 1
                 sim_time = sim_time_seconds
                 beam_hits = None
+                dvl_altitude_m = None
                 dvl_random_drop = False
                 try:
                     beam_hits = [bool(hit) for hit in dvl_sensor.get_beam_hit()]
@@ -2244,21 +2266,26 @@ def main() -> None:
                 dvl_beam_dropout = beam_hits is not None and beam_hits.count(False) >= dvl_beam_dropout_threshold
                 dvl_valid_bottom_lock = beam_hits is not None and not dvl_beam_dropout
                 dvl_dropout_probability = max(0.0, min(1.0, dvl_random_dropout_probability))
-                if dvl_range_dropout_probability > 0.0:
-                    try:
-                        ranges = np.asarray(dvl_sensor.get_depth(), dtype=float)
-                        finite_ranges = ranges[np.isfinite(ranges)]
-                        if finite_ranges.size > 0:
-                            altitude = float(np.min(finite_ranges))
-                            if altitude >= dvl_range_dropout_start_m:
-                                denom = max(dvl_range_dropout_full_m - dvl_range_dropout_start_m, 1e-9)
-                                range_fraction = max(0.0, min(1.0, (altitude - dvl_range_dropout_start_m) / denom))
-                                dvl_dropout_probability = max(
-                                    dvl_dropout_probability,
-                                    range_fraction * max(0.0, min(1.0, dvl_range_dropout_probability)),
-                                )
-                    except Exception:
-                        pass
+                try:
+                    ranges = np.asarray(dvl_sensor.get_depth(), dtype=float)
+                    finite_ranges = ranges[np.isfinite(ranges) & (ranges > 0.0)]
+                    if finite_ranges.size > 0:
+                        # Water Linked altitude is the distance to the reflecting
+                        # surface along the DVL Z axis, not the slant beam range.
+                        dvl_altitude_m = float(np.mean(finite_ranges) * abs(cos_elevation))
+                except Exception:
+                    dvl_altitude_m = None
+                if dvl_range_dropout_probability > 0.0 and dvl_altitude_m is not None:
+                    if dvl_altitude_m >= dvl_range_dropout_start_m:
+                        denom = max(dvl_range_dropout_full_m - dvl_range_dropout_start_m, 1e-9)
+                        range_fraction = max(
+                            0.0,
+                            min(1.0, (dvl_altitude_m - dvl_range_dropout_start_m) / denom),
+                        )
+                        dvl_dropout_probability = max(
+                            dvl_dropout_probability,
+                            range_fraction * max(0.0, min(1.0, dvl_range_dropout_probability)),
+                        )
                 if dvl_dropout_probability > 0.0:
                     dvl_random_drop = bool(dvl_rng.random() < dvl_dropout_probability)
                 dvl_bottom_lock_drop = (
@@ -2278,7 +2305,7 @@ def main() -> None:
                 if (not dvl_drop_active) and (
                     (not dvl_require_bottom_lock and not dvl_beam_dropout)
                     or (dvl_require_bottom_lock and dvl_valid_bottom_lock)
-                ):
+                ) and dvl_altitude_m is not None:
                     sec, nanosec = _split_ros_time(sim_time)
                     body_rotation = rotation_matrix_from_quat(q)
                     angular_velocity_body = body_rotation.T @ ang_world
@@ -2357,10 +2384,12 @@ def main() -> None:
                                 dvl_attr_angular_z.set(0.0)
                         if dvl_attr_covariance is not None:
                             dvl_attr_covariance.set(dvl_twist_covariance)
+                    dvl_altitude_attr_data.set(dvl_altitude_m)
                     if dvl_publish_impulse_attr is not None:
                         dvl_publish_impulse_attr.set(True)
                         og.Controller.evaluate_sync(dvl_graph)
                         sensor_publish_counts["dvl_messages"] += 1
+                        sensor_publish_counts["dvl_altitude_messages"] += 1
             pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
                 pos, q, lin_world, ang_world
             )
@@ -2604,6 +2633,7 @@ def main() -> None:
         timing_window_camera_ms = 0.0
         timing_window_loop_ms = 0.0
         timing_window_frames = 0
+        rtf_warning_active = False
         next_render_deadline = time.perf_counter()
         if rtx_rate_control_enabled:
             print(
@@ -2681,27 +2711,29 @@ def main() -> None:
                             count = sensor_deltas[name]
                             return f"{count / sim_elapsed:.1f}/{count / wall_elapsed:.1f}"
 
-                        print(
-                            "[Sensor rates sim/wall Hz] "
-                            f"RTF={real_time_factor:.3f}, "
-                            f"physics={physics_steps / sim_elapsed:.1f}/{physics_steps / wall_elapsed:.1f}, "
-                            f"render={measured_render_sim_hz:.2f}/{measured_render_wall_hz:.2f}, "
-                            f"lidar={measured_lidar_sim_hz:.2f}/{measured_lidar_wall_hz:.2f}, "
-                            f"camera={_sensor_rate_text('camera_processed')}, "
-                            f"imu={_sensor_rate_text('imu')}, "
-                            f"mag={_sensor_rate_text('magnetometer')}, "
-                            f"pressure={_sensor_rate_text('barometer')}, "
-                            f"dvl_samples={_sensor_rate_text('dvl_samples')}, "
-                            f"dvl_messages={_sensor_rate_text('dvl_messages')}, "
-                            f"dvl dropouts={sensor_deltas['dvl_dropouts']}"
-                        )
-                        timing_divisor = max(timing_window_frames, 1)
-                        print(
-                            "[Frame timing] "
-                            f"app_update={timing_window_step_ms / timing_divisor:.2f} ms, "
-                            f"camera={timing_window_camera_ms / timing_divisor:.2f} ms, "
-                            f"whole_loop={timing_window_loop_ms / timing_divisor:.2f} ms"
-                        )
+                        if log_sensor_rates:
+                            print(
+                                "[Sensor rates sim/wall Hz] "
+                                f"RTF={real_time_factor:.3f}, "
+                                f"physics={physics_steps / sim_elapsed:.1f}/{physics_steps / wall_elapsed:.1f}, "
+                                f"render={measured_render_sim_hz:.2f}/{measured_render_wall_hz:.2f}, "
+                                f"lidar={measured_lidar_sim_hz:.2f}/{measured_lidar_wall_hz:.2f}, "
+                                f"camera={_sensor_rate_text('camera_processed')}, "
+                                f"imu={_sensor_rate_text('imu')}, "
+                                f"mag={_sensor_rate_text('magnetometer')}, "
+                                f"pressure={_sensor_rate_text('barometer')}, "
+                                f"dvl_samples={_sensor_rate_text('dvl_samples')}, "
+                                f"dvl_messages={_sensor_rate_text('dvl_messages')}, "
+                                f"dvl_altitude={_sensor_rate_text('dvl_altitude_messages')}, "
+                                f"dvl dropouts={sensor_deltas['dvl_dropouts']}"
+                            )
+                            timing_divisor = max(timing_window_frames, 1)
+                            print(
+                                "[Frame timing] "
+                                f"app_update={timing_window_step_ms / timing_divisor:.2f} ms, "
+                                f"camera={timing_window_camera_ms / timing_divisor:.2f} ms, "
+                                f"whole_loop={timing_window_loop_ms / timing_divisor:.2f} ms"
+                            )
 
                         previous_frame_skip_count = rtx_lidar_current_frame_skip_count
                         if rtx_rate_control_enabled:
@@ -2736,25 +2768,25 @@ def main() -> None:
                                     )
                                 except Exception:
                                     pass
-                            estimated_publish_hz = rtx_smoothed_control_render_hz / float(
-                                rtx_lidar_current_frame_skip_count + 1
-                            )
-                            print(
-                                "[RTX lidar rate control] "
-                                f"next {rtx_rate_domain} estimate={estimated_publish_hz:.2f} Hz, "
-                                f"frame_skip_count={previous_frame_skip_count}"
-                                + (
-                                    f" -> {rtx_lidar_current_frame_skip_count}"
-                                    if previous_frame_skip_count != rtx_lidar_current_frame_skip_count
-                                    else ""
+                                estimated_publish_hz = rtx_smoothed_control_render_hz / float(
+                                    rtx_lidar_current_frame_skip_count + 1
                                 )
-                            )
+                                print(
+                                    "[RTX lidar rate control] "
+                                    f"frame_skip_count={previous_frame_skip_count} -> "
+                                    f"{rtx_lidar_current_frame_skip_count}, "
+                                    f"estimated {rtx_rate_domain} rate={estimated_publish_hz:.2f} Hz"
+                                )
 
                         if realtime and real_time_factor < 0.98:
-                            print(
-                                "[Sensor performance warning] "
-                                f"RTF={real_time_factor:.3f}; wall-clock sensor rates are below their configured rates."
-                            )
+                            if not rtf_warning_active:
+                                print(
+                                    "[Sensor performance warning] "
+                                    f"RTF={real_time_factor:.3f}; wall-clock sensor rates are below their configured rates."
+                                )
+                            rtf_warning_active = True
+                        else:
+                            rtf_warning_active = False
 
                         rtx_rate_window_started_at = rate_now
                         rtx_rate_window_sim_started_at = sim_time_seconds

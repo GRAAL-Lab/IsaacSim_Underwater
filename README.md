@@ -302,6 +302,7 @@ The script sets up ROS2 graphs for:
   - Magnetometer config values use microtesla (`*_ut`) and microtesla-squared (`*_ut2`) for readability; the ROS message is published in Tesla as required by `sensor_msgs/msg/MagneticField`.
 - **DVL** (`geometry_msgs/TwistWithCovarianceStamped`): `sensors.dvl.ros2_topic` (default: `/auv/dvl`)
   - The DVL comes from **OceanSim** and uses OceanSim beam covariance for Gaussian velocity/range noise plus optional random and range-dependent dropout. The default values are tuned to a Water Linked A50-style setup.
+  - **DVL altitude** (`std_msgs/msg/Float64`): `sensors.dvl.ros2_altitude_topic` (default: `/auv/dvl/altitude`). The value is the distance in meters to the reflecting surface along the DVL Z axis, matching Water Linked's altitude definition. Velocity and altitude messages are both suppressed while bottom lock is invalid or a simulated dropout is active.
 - **Pressure** (`sensor_msgs/FluidPressure`): `sensors.barometer.ros2_topic` (default: `/auv/pressure/scaled2`)
   - The pressure model computes hydrostatic pressure from depth, then applies a run-level pressure bias, white pressure noise, quantization, and message variance.
 
@@ -360,9 +361,9 @@ Rates are scheduled in simulation time. When real-time factor (RTF) is below 1.0
 | Water Linked 3D-15-style low-frequency sonar | 6 Hz | Experimental target; current manufacturer low-frequency specification is 5 Hz |
 | Navigator ICM-20602-style IMU | 300 Hz | Simulation physics ceiling; the device supports substantially higher raw ODR |
 | Navigator MMC5983-style magnetometer | 300 Hz | Simulation physics ceiling; the device supports up to 1000 Hz ODR |
-| Bar30/MS5837-30BA-style pressure | 25 Hz | Approximately one high-resolution pressure and temperature read every 40 ms |
+| Bar30/MS5837-30BA-style pressure | 300 Hz | Experiment cadence, aligned with the IMU and simulation physics rate |
 
-References: [Water Linked A50 range modes](https://docs.waterlinked.com/dvl/range-mode/), [Water Linked Sonar 3D-15 datasheet](https://waterlinked.com/datasheets/sonar-3D-15), [Navigator specifications](https://bluerobotics.com/store/comm-control-power/control/navigator/), [ICM-20602 datasheet](https://invensense.tdk.com/wp-content/uploads/2020/11/DS-000176-ICM-20602-v1.1.pdf), [MMC5983MA datasheet](https://www.memsic.com/Public/Uploads/uploadfile/files/20220119/MMC5983MADatasheetRevA.pdf), and [Blue Robotics MS5837 library](https://github.com/bluerobotics/BlueRobotics_MS5837_Library).
+References: [Water Linked A50 range modes](https://docs.waterlinked.com/dvl/range-mode/), [Water Linked DVL protocol](https://docs.waterlinked.com/dvl/dvl-json-protocol/), [Water Linked ROS 2 driver](https://github.com/waterlinked/waterlinked_dvl), [Water Linked Sonar 3D-15 datasheet](https://waterlinked.com/datasheets/sonar-3D-15), [Navigator specifications](https://bluerobotics.com/store/comm-control-power/control/navigator/), [ICM-20602 datasheet](https://invensense.tdk.com/wp-content/uploads/2020/11/DS-000176-ICM-20602-v1.1.pdf), [MMC5983MA datasheet](https://www.memsic.com/Public/Uploads/uploadfile/files/20220119/MMC5983MADatasheetRevA.pdf), and [Blue Robotics MS5837 library](https://github.com/bluerobotics/BlueRobotics_MS5837_Library).
 - no OmniGraph needs to be pre-authored in a lidar asset
 
 
@@ -452,13 +453,14 @@ Notable keys:
 - `map.usd_path`: USD stage to load (relative paths resolve relative to repo root)
 - `robot.prim_path`: embedded prim path inside the USD
 - `simulation.timing.physics_hz`, `simulation.timing.render_fps`
+- `simulation.diagnostics.log_sensor_rates`: enables the rolling sensor-rate and frame-timing logs; disabled by default
 - `sensors.*`: camera, DVL, IMU, magnetometer configuration (poses + ROS topics)
 - `sensors.uw_camera.uw_effects`: OceanSim underwater attenuation/backscatter parameters
 - `sensors.uw_camera.ros2_processed_topic`: processed underwater image topic
 - `sensors.imaging_sonar.*`: OceanSim 2D imaging sonar pose, processing, and ROS topic
   - includes stream sizing via `stream_width` / `stream_height`
   - includes stability/performance mode via `fetch_on_device`
-- `sensors.dvl.*`: Water Linked A50-style beam geometry, altitude limits, velocity/range covariance, bottom-lock checks, and random/range-dependent dropout
+- `sensors.dvl.*`: Water Linked A50-style beam geometry, velocity and altitude topics, altitude limits, velocity/range covariance, bottom-lock checks, and random/range-dependent dropout
 - `sensors.imu.noise.*`: Blue Robotics Navigator ICM-20602-style gyro/accelerometer white noise densities, bias random walk, gravity inclusion, orientation noise, and covariance publishing
 - `sensors.magnetometer.*`: local ENU magnetic field vector, Blue Robotics Navigator/MMC5983MA-style report rate/range/resolution/noise settings, hard/soft iron settings, saturation, quantization, and ROS topic
 - `sensors.barometer.*`: Bar30/MS5837-30BA-style hydrostatic pressure, absolute-accuracy bias, pressure resolution noise, quantization, and ROS topic

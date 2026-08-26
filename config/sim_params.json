@@ -10,6 +10,9 @@
       "physics_hz": 300.0,
       "render_fps": 30.0,
       "realtime": true
+    },
+    "diagnostics": {
+      "log_sensor_rates": false
     }
   },
   "map": {
@@ -164,6 +167,7 @@
       ],
       "frequency_hz": 15,
       "ros2_topic": "/auv/dvl",
+      "ros2_altitude_topic": "/auv/dvl/altitude",
       "ros2_frame_id": "dvl_link",
       "elevation_deg": 22.5,
       "rotation_deg": 45.0,
@@ -343,7 +347,7 @@
         0.0,
         0.0
       ],
-      "frequency_hz": 25.0,
+      "frequency_hz": 300.0,
       "ros2_topic": "/auv/pressure/scaled2",
       "ros2_frame_id": "barometer_link",
       "surface_z": 0.0,
