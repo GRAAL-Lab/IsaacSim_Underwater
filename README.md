@@ -61,10 +61,12 @@ This simulation uses `isaacsim.ros2.bridge` and publishes/subscribes ROS2 topics
 
 Before running Isaac Sim scripts, **always source Isaac Sim’s ROS environment**:
 ```bash
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH
+unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION RMW_IMPLEMENTATION
 source "$ISAACSIM_ROOT/setup_ros_env.sh"
 ```
 
-> If you’re running additional ROS tools for control or visualization, use a separate terminal with your ROS2 environment sourced as usual.
+Clearing an inherited system ROS environment prevents Python 3.12 packages from being loaded into Isaac Sim's Python 3.11. If you’re running additional ROS tools for control or visualization, use a separate terminal with your normal ROS2 environment sourced.
 
 ### 4) Marine Vehicle Models (MVM) + Python bindings (required)
 The underwater vehicle dynamics are computed using the **MVM `underwater_vehicle_model`** library via the Python module `mvm_py`.
@@ -211,6 +213,8 @@ export MVM_ROOT=/path/to/marine_vehicle_models
 export MVM_PY_PATH="$MVM_ROOT/underwater_vehicle_model/build_isaac_py311"
 
 # Isaac Sim ROS bridge environment
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH PYTHONPATH
+unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION RMW_IMPLEMENTATION
 source "$ISAACSIM_ROOT/setup_ros_env.sh"
 ```
 
@@ -280,10 +284,11 @@ The script sets up ROS2 graphs for:
   - dynamic `World -> BROV_low`
   - static `BROV_low ->` each enabled sensor frame (`uw_camera_link`, `imaging_sonar_link`, `rtx_lidar_link`, `imu_link`, `dvl_link`)
 - **Underwater RGB camera** (Image + CameraInfo):
-  - `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
+  - optional raw image: `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
   - `sensors.uw_camera.ros2_camera_info_topic` (default: `/IsaacSim/uw_camera/camera_info`)
   - processed underwater image (raw `sensor_msgs/Image`): `sensors.uw_camera.ros2_processed_topic`
-    - default: `/IsaacSim/uw_camera/processed/image_raw`
+    - default: `/IsaacSim/uw_camera/processed`
+  - raw, processed, and camera-info publishers are controlled by `publish_raw`, `publish_processed`, and `publish_camera_info`; the default setup publishes only the processed 1080p image and camera info
 - **OceanSim 2D imaging sonar** (raw `sensor_msgs/Image`):
   - `sensors.imaging_sonar.ros2_topic` (default: `/IsaacSim/imaging_sonar/image_raw`)
   - `sensors.imaging_sonar.ros2_frame_id` (default: `imaging_sonar_link`)
@@ -402,11 +407,11 @@ You only need to run the simulation:
 ```
 
 Camera topics:
-- raw RGB image: `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
+- optional raw RGB image: `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
 - camera info: `sensors.uw_camera.ros2_camera_info_topic` (default: `/IsaacSim/uw_camera/camera_info`)
-- processed underwater image: `sensors.uw_camera.ros2_processed_topic` (default: `/IsaacSim/uw_camera/processed/image_raw`)
+- processed underwater image: `sensors.uw_camera.ros2_processed_topic` (default: `/IsaacSim/uw_camera/processed`)
 
-The processed image is published as raw `sensor_msgs/Image`, so RViz2 can subscribe to it directly with a normal `Image` display.
+The processed image is published as raw `sensor_msgs/Image`, so RViz2 can subscribe to it directly with a normal `Image` display. The default configuration sets `publish_raw=false`, `publish_processed=true`, `publish_camera_info=true`, and `ros2_queue_size=1` to avoid a second uncompressed 1080p image stream.
 
 The underwater effect parameters come from:
 - `sensors.uw_camera.uw_effects` in `config/sim_params.json`

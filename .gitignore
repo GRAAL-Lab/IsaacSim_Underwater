@@ -217,4 +217,6 @@ COLCON_IGNORE
 
 ulisse_ctrl/cmake-build-debug/*
 Experiments/*
-/Assets/
+/Assets/*
+!/Assets/ThreeDSonar_LowFrequency.json
+!/Assets/ThreeDSonar_LowFrequency_Noisy.json

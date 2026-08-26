@@ -3,7 +3,8 @@
     "app": {
       "headless": true,
       "disable_viewport_updates": true,
-      "enable_motion_bvh": true
+      "enable_motion_bvh": true,
+      "dlss_exec_mode": 0
     },
     "timing": {
       "physics_hz": 300.0,
@@ -50,6 +51,10 @@
         1080
       ],
       "frequency_hz": 30.0,
+      "publish_raw": false,
+      "publish_processed": true,
+      "publish_camera_info": true,
+      "ros2_queue_size": 1,
       "uw_effects": {
         "backscatter_value": [
           0.0,
