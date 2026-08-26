@@ -723,6 +723,7 @@ def main() -> None:
     )
 
     from isaacsim.core.api import World
+    from isaacsim.core.nodes.bindings import _isaacsim_core_nodes
     from isaacsim.core.prims import RigidPrim, SingleXFormPrim
     from isaacsim.core.utils.extensions import enable_extension
     from isaacsim.core.utils.prims import get_prim_at_path
@@ -739,6 +740,22 @@ def main() -> None:
     from pxr import Gf, Sdf
 
     keys = og.Controller.Keys
+    core_nodes = _isaacsim_core_nodes.acquire_interface()
+
+    def _read_simulation_time() -> float:
+        """Read the same monotonic simulation clock used by IsaacReadSimulationTime."""
+        return float(core_nodes.get_sim_time_monotonic())
+
+    def _use_explicit_image_sample_time(graph_path: str):
+        """Let a delayed image publisher use acquisition time instead of execution time."""
+        read_time_attr = og.Controller.attribute(f"{graph_path}/ReadSimTime.outputs:simulationTime")
+        publish_time_attr = og.Controller.attribute(f"{graph_path}/PublishImage.inputs:timeStamp")
+        reset_on_stop_attr = og.Controller.attribute(f"{graph_path}/ReadSimTime.inputs:resetOnStop")
+        if reset_on_stop_attr is not None:
+            reset_on_stop_attr.set(False)
+        if read_time_attr is not None and publish_time_attr is not None:
+            og.Controller.disconnect(read_time_attr, publish_time_attr)
+        return publish_time_attr
 
     # Isaac Sim performs multiple PhysX substeps inside each rendered app update.
     physics_hz = float(sim_cfg["timing"]["physics_hz"])
@@ -921,7 +938,7 @@ def main() -> None:
                     ("PublishRtxLidar.inputs:showDebugView", bool(rtx_lidar_cfg["show_debug_view"])),
                     ("PublishRtxLidar.inputs:nodeNamespace", ros_namespace),
                     ("PublishRtxLidar.inputs:queueSize", queue_size),
-                    ("PublishRtxLidar.inputs:resetSimulationTimeOnStop", True),
+                    ("PublishRtxLidar.inputs:resetSimulationTimeOnStop", False),
                 ],
             },
         )
@@ -1054,6 +1071,7 @@ def main() -> None:
     uw_camera = None
     camera_frame_skip = 0
     camera_publish_processed = False
+    processed_camera_timestamp_attr = None
     if bool(uw_camera_cfg["enabled"]):
         camera_publish_raw = bool(uw_camera_cfg.get("publish_raw", True))
         camera_publish_processed = bool(uw_camera_cfg.get("publish_processed", True))
@@ -1103,6 +1121,7 @@ def main() -> None:
                         ("CameraHelperRgb.inputs:queueSize", camera_queue_size),
                         ("CameraHelperRgb.inputs:nodeNamespace", ros_namespace),
                         ("CameraHelperRgb.inputs:frameSkipCount", camera_frame_skip),
+                        ("CameraHelperRgb.inputs:resetSimulationTimeOnStop", False),
                     ]
                 )
             if camera_publish_info:
@@ -1116,6 +1135,7 @@ def main() -> None:
                         ("CameraHelperInfo.inputs:queueSize", camera_queue_size),
                         ("CameraHelperInfo.inputs:nodeNamespace", ros_namespace),
                         ("CameraHelperInfo.inputs:frameSkipCount", camera_frame_skip),
+                        ("CameraHelperInfo.inputs:resetSimulationTimeOnStop", False),
                     ]
                 )
             og.Controller.edit(
@@ -1135,6 +1155,9 @@ def main() -> None:
                 queue_size=camera_queue_size,
                 graph_path="/ROS2ProcessedUWCameraGraph",
             )
+            processed_camera_timestamp_attr = _use_explicit_image_sample_time(
+                "/ROS2ProcessedUWCameraGraph"
+            )
         print(
             "[Underwater camera] "
             f"raw={camera_publish_raw}, processed={camera_publish_processed}, "
@@ -1142,6 +1165,7 @@ def main() -> None:
         )
 
     imaging_sonar = None
+    imaging_sonar_timestamp_attr = None
     imaging_sonar_cfg = sensors_cfg.get("imaging_sonar", {})
     imaging_sonar_every = 1
     imaging_sonar_tick = 0
@@ -1181,12 +1205,17 @@ def main() -> None:
             stream_height=imaging_sonar_stream_height,
             graph_path="/ROS2ImagingSonarGraph",
         )
+        imaging_sonar_timestamp_attr = _use_explicit_image_sample_time("/ROS2ImagingSonarGraph")
         sonar_freq = max(float(imaging_sonar_cfg.get("frequency_hz", 0.0)), 1e-6)
         imaging_sonar_every = max(1, int(round(physics_hz / sonar_freq)))
 
     def _render_imaging_sonar_frame() -> bool:
         if imaging_sonar is None:
             return False
+        if imaging_sonar_timestamp_attr is not None and last_render_sample_time is not None:
+            imaging_sonar_timestamp_attr.set(
+                _record_sample_time("imaging_sonar", last_render_sample_time)
+            )
         processing_cfg = imaging_sonar_cfg.get("processing", {})
         return imaging_sonar.step_render_publish(
             stream_width=imaging_sonar_stream_width,
@@ -1225,6 +1254,7 @@ def main() -> None:
                 ("PublishPose", "isaacsim.ros2.bridge.ROS2Publisher"),
             ],
             keys.SET_VALUES: [
+                ("ReadSimTime.inputs:resetOnStop", False),
                 ("ReadPose.inputs:prim", [usdrt.Sdf.Path(robot_prim_path)]),
                 ("PublishPose.inputs:topicName", pose_topic),
                 ("PublishPose.inputs:messagePackage", "geometry_msgs"),
@@ -1283,6 +1313,7 @@ def main() -> None:
         ("PublishBaseTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
     ]
     tf_set_values = [
+        ("ReadSimTime.inputs:resetOnStop", False),
         ("PublishBaseTF.inputs:parentFrameId", "World"),
         ("PublishBaseTF.inputs:childFrameId", pose_frame_id),
         ("PublishBaseTF.inputs:nodeNamespace", ros_namespace),
@@ -1353,7 +1384,7 @@ def main() -> None:
         ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
         ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
     ]
-    static_tf_set_values = []
+    static_tf_set_values = [("ReadSimTime.inputs:resetOnStop", False)]
     static_tf_connections = []
 
     static_tf_specs: list[tuple[str, str, list[float], list[float]]] = []
@@ -1468,8 +1499,7 @@ def main() -> None:
         {"graph_path": clock_graph_path, "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("ClockPublishImpulse", "omni.graph.action.OnImpulseEvent"),
                 ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
             ],
             keys.SET_VALUES: [
@@ -1478,12 +1508,17 @@ def main() -> None:
                 ("PublishClock.inputs:queueSize", queue_size),
             ],
             keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "PublishClock.inputs:execIn"),
-                ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
+                ("ClockPublishImpulse.outputs:execOut", "PublishClock.inputs:execIn"),
             ],
         },
     )
     simulation_app.update()
+    clock_graph = og.Controller.graph(clock_graph_path)
+    clock_graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
+    clock_publish_impulse_attr = og.Controller.attribute(
+        f"{clock_graph_path}/ClockPublishImpulse.state:enableImpulse"
+    )
+    clock_timestamp_attr = og.Controller.attribute(f"{clock_graph_path}/PublishClock.inputs:timeStamp")
 
     velocity_graph_path = "/ROS2VelocityGraph"
     og.Controller.edit(
@@ -1982,13 +2017,25 @@ def main() -> None:
     for row in range(3):
         for col in range(3):
             dvl_twist_covariance[row * 6 + col] = float(dvl_linear_cov_sensor[row, col])
-    def _split_ros_time(sim_time: float) -> tuple[int, int]:
-        sec = int(sim_time)
-        nanosec = int(round((sim_time - sec) * 1e9))
-        if nanosec >= 1_000_000_000:
-            sec += 1
-            nanosec -= 1_000_000_000
-        return sec, nanosec
+    last_sample_stamp_ns: dict[str, int] = {}
+
+    def _record_sample_time(sensor_name: str, sim_time: float) -> float:
+        """Validate and record a strictly increasing acquisition timestamp."""
+        if not math.isfinite(sim_time) or sim_time < 0.0:
+            raise RuntimeError(f"{sensor_name} produced invalid simulation time {sim_time!r}")
+        stamp_ns = int(round(sim_time * 1e9))
+        previous_stamp_ns = last_sample_stamp_ns.get(sensor_name)
+        if previous_stamp_ns is not None and stamp_ns <= previous_stamp_ns:
+            raise RuntimeError(
+                f"{sensor_name} sample timestamp is not monotonic: "
+                f"{stamp_ns} ns <= {previous_stamp_ns} ns"
+            )
+        last_sample_stamp_ns[sensor_name] = stamp_ns
+        return stamp_ns * 1e-9
+
+    def _sample_header_stamp(sensor_name: str, sim_time: float) -> tuple[int, int]:
+        stamp_ns = int(round(_record_sample_time(sensor_name, sim_time) * 1e9))
+        return divmod(stamp_ns, 1_000_000_000)
 
     prev_lin_world = np.zeros(3, dtype=float)
     prev_ang_world = np.zeros(3, dtype=float)
@@ -2054,7 +2101,7 @@ def main() -> None:
         )
 
     callback_counter = 0
-    sim_time_seconds = 0.0
+    sim_time_seconds = _read_simulation_time()
     sensor_publish_counts = {
         "barometer": 0,
         "magnetometer": 0,
@@ -2067,13 +2114,17 @@ def main() -> None:
     }
 
     render_this_step_flag = False
+    last_render_sample_time = None
 
     def _on_physics_step(_step_size: float) -> None:
         nonlocal baro_next_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag, sim_time_seconds
         nonlocal dvl_dropout_until_time, dvl_last_dropout_start_time
         nonlocal imu_next_pub_time, magnetometer_next_pub_time
         try:
-            sim_time_seconds += float(_step_size)
+            sim_time_seconds = _read_simulation_time()
+            clock_timestamp_attr.set(_record_sample_time("clock", sim_time_seconds))
+            clock_publish_impulse_attr.set(True)
+            og.Controller.evaluate_sync(clock_graph)
             if dvl_publish_impulse_attr is not None:
                 dvl_publish_impulse_attr.set(False)
             state = _read_state()
@@ -2082,11 +2133,7 @@ def main() -> None:
             pos, q, lin_world, ang_world = state
             if pose_pub_node is not None:
                 sim_time = sim_time_seconds
-                sec = int(sim_time)
-                nanosec = int(round((sim_time - sec) * 1e9))
-                if nanosec >= 1_000_000_000:
-                    sec += 1
-                    nanosec -= 1_000_000_000
+                sec, nanosec = _sample_header_stamp("pose", sim_time)
                 quat_xyzw = [float(q[1]), float(q[2]), float(q[3]), float(q[0])]
                 if pose_attr_header is not None:
                     pose_attr_header.set(
@@ -2151,11 +2198,7 @@ def main() -> None:
                     baro_period,
                 )
                 if baro_publish_due:
-                    sec = int(sim_time)
-                    nanosec = int(round((sim_time - sec) * 1e9))
-                    if nanosec >= 1_000_000_000:
-                        sec += 1
-                        nanosec -= 1_000_000_000
+                    sec, nanosec = _sample_header_stamp("barometer", sim_time)
                     surface_z = float(baro_cfg.get("surface_z", 0.0))
                     depth = max(0.0, surface_z - float(pos[2]))
                     fluid_density = float(baro_cfg.get("fluid_density", 1025.0))
@@ -2201,7 +2244,7 @@ def main() -> None:
                     magnetometer_period,
                 )
                 if magnetometer_publish_due:
-                    sec, nanosec = _split_ros_time(sim_time)
+                    sec, nanosec = _sample_header_stamp("magnetometer", sim_time)
                     magnetic_field = _simulate_magnetometer_measurement(
                         orientation_wxyz=q,
                         magnetometer_cfg=magnetometer_cfg,
@@ -2306,7 +2349,7 @@ def main() -> None:
                     (not dvl_require_bottom_lock and not dvl_beam_dropout)
                     or (dvl_require_bottom_lock and dvl_valid_bottom_lock)
                 ) and dvl_altitude_m is not None:
-                    sec, nanosec = _split_ros_time(sim_time)
+                    sec, nanosec = _sample_header_stamp("dvl", sim_time)
                     body_rotation = rotation_matrix_from_quat(q)
                     angular_velocity_body = body_rotation.T @ ang_world
                     dvl_velocity_body = np.asarray(dvl_velocity_sample[:3], dtype=float) + np.cross(
@@ -2400,7 +2443,7 @@ def main() -> None:
                 imu_period,
             )
             if imu_publish_due:
-                sec, nanosec = _split_ros_time(sim_time)
+                sec, nanosec = _sample_header_stamp("imu", sim_time)
                 (
                     imu_orientation_wxyz,
                     imu_angular_velocity,
@@ -2656,6 +2699,10 @@ def main() -> None:
             )
             if camera_due:
                 cam_start = time.perf_counter()
+                if processed_camera_timestamp_attr is not None and last_render_sample_time is not None:
+                    processed_camera_timestamp_attr.set(
+                        _record_sample_time("camera_processed", last_render_sample_time)
+                    )
                 if uw_camera.step_processed():
                     sensor_publish_counts["camera_processed"] += 1
                 camera_ms = (time.perf_counter() - cam_start) * 1000.0
@@ -2667,6 +2714,7 @@ def main() -> None:
             render_this_step_flag = True
             step_start = time.perf_counter()
             world.step(render=True)
+            last_render_sample_time = _read_simulation_time()
             step_ms = (time.perf_counter() - step_start) * 1000.0
             render_this_step_flag = False
 
