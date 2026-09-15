@@ -2699,12 +2699,21 @@ def main() -> None:
             )
             if camera_due:
                 cam_start = time.perf_counter()
-                if processed_camera_timestamp_attr is not None and last_render_sample_time is not None:
-                    processed_camera_timestamp_attr.set(
-                        _record_sample_time("camera_processed", last_render_sample_time)
-                    )
-                if uw_camera.step_processed():
-                    sensor_publish_counts["camera_processed"] += 1
+                camera_frame = uw_camera.get_current_frame()
+                camera_sample_time = float(camera_frame["rendering_time"])
+                camera_sample_time_ns = int(round(camera_sample_time * 1e9))
+                previous_camera_stamp_ns = last_sample_stamp_ns.get("camera_processed", -1)
+                if (
+                    math.isfinite(camera_sample_time)
+                    and camera_sample_time > 0.0
+                    and camera_sample_time_ns > previous_camera_stamp_ns
+                ):
+                    if processed_camera_timestamp_attr is not None:
+                        processed_camera_timestamp_attr.set(
+                            _record_sample_time("camera_processed", camera_sample_time)
+                        )
+                    if uw_camera.step_processed():
+                        sensor_publish_counts["camera_processed"] += 1
                 camera_ms = (time.perf_counter() - cam_start) * 1000.0
 
             rtx_lidar_render_this_step = (
