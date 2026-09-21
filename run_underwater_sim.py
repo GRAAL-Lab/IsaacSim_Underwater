@@ -746,17 +746,6 @@ def main() -> None:
         """Read the same monotonic simulation clock used by IsaacReadSimulationTime."""
         return float(core_nodes.get_sim_time_monotonic())
 
-    def _use_explicit_image_sample_time(graph_path: str):
-        """Let a delayed image publisher use acquisition time instead of execution time."""
-        read_time_attr = og.Controller.attribute(f"{graph_path}/ReadSimTime.outputs:simulationTime")
-        publish_time_attr = og.Controller.attribute(f"{graph_path}/PublishImage.inputs:timeStamp")
-        reset_on_stop_attr = og.Controller.attribute(f"{graph_path}/ReadSimTime.inputs:resetOnStop")
-        if reset_on_stop_attr is not None:
-            reset_on_stop_attr.set(False)
-        if read_time_attr is not None and publish_time_attr is not None:
-            og.Controller.disconnect(read_time_attr, publish_time_attr)
-        return publish_time_attr
-
     # Isaac Sim performs multiple PhysX substeps inside each rendered app update.
     physics_hz = float(sim_cfg["timing"]["physics_hz"])
     render_fps = float(sim_cfg["timing"]["render_fps"])
@@ -1071,7 +1060,6 @@ def main() -> None:
     uw_camera = None
     camera_frame_skip = 0
     camera_publish_processed = False
-    processed_camera_timestamp_attr = None
     if bool(uw_camera_cfg["enabled"]):
         camera_publish_raw = bool(uw_camera_cfg.get("publish_raw", True))
         camera_publish_processed = bool(uw_camera_cfg.get("publish_processed", True))
@@ -1154,9 +1142,6 @@ def main() -> None:
                 ros_namespace=ros_namespace,
                 queue_size=camera_queue_size,
                 graph_path="/ROS2ProcessedUWCameraGraph",
-            )
-            processed_camera_timestamp_attr = _use_explicit_image_sample_time(
-                "/ROS2ProcessedUWCameraGraph"
             )
         print(
             "[Underwater camera] "
@@ -2699,21 +2684,10 @@ def main() -> None:
             )
             if camera_due:
                 cam_start = time.perf_counter()
-                camera_frame = uw_camera.get_current_frame()
-                camera_sample_time = float(camera_frame["rendering_time"])
-                camera_sample_time_ns = int(round(camera_sample_time * 1e9))
-                previous_camera_stamp_ns = last_sample_stamp_ns.get("camera_processed", -1)
-                if (
-                    math.isfinite(camera_sample_time)
-                    and camera_sample_time > 0.0
-                    and camera_sample_time_ns > previous_camera_stamp_ns
-                ):
-                    if processed_camera_timestamp_attr is not None:
-                        processed_camera_timestamp_attr.set(
-                            _record_sample_time("camera_processed", camera_sample_time)
-                        )
-                    if uw_camera.step_processed():
-                        sensor_publish_counts["camera_processed"] += 1
+                camera_sample_time = uw_camera.step_processed()
+                if camera_sample_time is not None:
+                    _record_sample_time("camera_processed", camera_sample_time)
+                    sensor_publish_counts["camera_processed"] += 1
                 camera_ms = (time.perf_counter() - cam_start) * 1000.0
 
             rtx_lidar_render_this_step = (

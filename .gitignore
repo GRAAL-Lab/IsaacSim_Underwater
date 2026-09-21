@@ -220,3 +220,10 @@ Experiments/*
 /Assets/*
 !/Assets/ThreeDSonar_LowFrequency.json
 !/Assets/ThreeDSonar_LowFrequency_Noisy.json
+!/Assets/docking_station.usda
+!/Assets/textures/
+/Assets/textures/*
+!/Assets/textures/DICT_4X4_1000_1f.png
+!/Assets/textures/DICT_4X4_1000_2f.png
+!/Assets/textures/DICT_4X4_1000_3f.png
+!/Assets/textures/DICT_4X4_1000_4f.png
