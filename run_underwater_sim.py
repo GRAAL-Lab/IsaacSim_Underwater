@@ -9,6 +9,17 @@ from pathlib import Path
 
 import numpy as np
 
+from isaac_sitl.config import load_config_with_overlays
+from isaac_sitl.frames import (
+    body_flu_to_frd,
+    enu_position_to_ned,
+    enu_vector_to_ned,
+    orientation_enu_flu_to_ned_frd,
+)
+from isaac_sitl.mavlink_sensors import MavlinkSensorInjector
+from isaac_sitl.protocol import ArduSubJsonLink, build_fdm_payload
+from isaac_sitl.thrust import T200ThrustModel
+
 from uw_math import (
     quat_to_rpy,
     quat_wxyz_from_rpy_deg,
@@ -21,10 +32,8 @@ OCEANSIM_ENV = "OCEANSIM_ROOT"
 ISAACSIM_ENV = "ISAACSIM_ROOT"
 
 
-def _load_config(config_path: str) -> dict:
-    path = Path(config_path).expanduser().resolve()
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+def _load_config(config_path: str, overlay_paths: list[str] | None = None) -> dict:
+    return load_config_with_overlays(config_path, overlay_paths or [])
 
 
 def _require(config: dict, dotted_key: str):
@@ -638,6 +647,30 @@ def _validate_config(cfg: dict) -> None:
     ]
     for key in required_keys:
         _require(cfg, key)
+
+    control_cfg = cfg.get("control", {})
+    if not isinstance(control_cfg, dict):
+        raise ValueError("control must be an object")
+    control_source = str(control_cfg.get("source", "ros2_forces")).strip()
+    if control_source not in {"ros2_forces", "ardusub_sitl"}:
+        raise ValueError("control.source must be 'ros2_forces' or 'ardusub_sitl'")
+    if control_source == "ardusub_sitl":
+        for key in (
+            "control.ardusub_sitl.bind_address",
+            "control.ardusub_sitl.json_port",
+            "control.ardusub_sitl.packet_timeout_s",
+            "control.ardusub_sitl.mavlink_sensor_endpoint",
+            "control.ardusub_sitl.battery_voltage_v",
+            "control.ardusub_sitl.water_surface_z",
+            "control.ardusub_sitl.home.latitude_deg",
+            "control.ardusub_sitl.home.longitude_deg",
+            "control.ardusub_sitl.home.altitude_m",
+            "control.ardusub_sitl.home.heading_deg",
+            "control.ardusub_sitl.thrust_curve_csv",
+            "control.ardusub_sitl.mvm_thruster_servo_channels",
+            "control.ardusub_sitl.mvm_thruster_directions",
+        ):
+            _require(cfg, key)
     _require_if_enabled(
         cfg,
         "sensors.imaging_sonar.enabled",
@@ -693,9 +726,15 @@ def _validate_config(cfg: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Strict Isaac Sim underwater runner")
     parser.add_argument("--config", required=True, help="Path to sim_params.json")
+    parser.add_argument(
+        "--overlay",
+        action="append",
+        default=[],
+        help="JSON overlay applied after --config; may be repeated",
+    )
     args, _ = parser.parse_known_args()
 
-    cfg = _load_config(args.config)
+    cfg = _load_config(args.config, args.overlay)
     _validate_config(cfg)
 
     config_dir = Path(args.config).expanduser().resolve().parent
@@ -705,6 +744,14 @@ def main() -> None:
     sim_cfg = cfg["simulation"]
     sensors_cfg = cfg["sensors"]
     mvm_cfg = cfg["mvm"]
+    control_cfg = cfg.get("control", {})
+    control_source = str(control_cfg.get("source", "ros2_forces")).strip()
+    sitl_enabled = control_source == "ardusub_sitl"
+    sitl_cfg = control_cfg.get("ardusub_sitl", {}) if sitl_enabled else {}
+    # In SITL mode, firmware sensor inputs are injected only over JSON/MAVLink
+    # and are not duplicated on ROS. Ground-truth pose, velocity, and
+    # acceleration remain published by Isaac in every control mode.
+    publish_firmware_sensor_inputs_ros = not sitl_enabled
     diagnostics_cfg = sim_cfg.get("diagnostics", {})
     if not isinstance(diagnostics_cfg, dict):
         raise ValueError("simulation.diagnostics must be an object")
@@ -1028,32 +1075,68 @@ def main() -> None:
     if msg_type not in {"Float32MultiArray", "Float64MultiArray"}:
         raise ValueError("mvm.forces_msg_type must be Float32MultiArray or Float64MultiArray")
 
-    thruster_graph_path = "/ROS2ThrusterForcesGraph"
-    og.Controller.edit(
-        {"graph_path": thruster_graph_path, "evaluator_name": "execution"},
-        {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
-                ("ThrusterForcesSub", "isaacsim.ros2.bridge.ROS2Subscriber"),
-            ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "ThrusterForcesSub.inputs:execIn"),
-                ("ROS2Context.outputs:context", "ThrusterForcesSub.inputs:context"),
-            ],
-            keys.SET_VALUES: [
-                ("ThrusterForcesSub.inputs:topicName", forces_topic),
-                ("ThrusterForcesSub.inputs:nodeNamespace", ros_namespace),
-                ("ThrusterForcesSub.inputs:queueSize", queue_size),
-                ("ThrusterForcesSub.inputs:messagePackage", "std_msgs"),
-                ("ThrusterForcesSub.inputs:messageSubfolder", "msg"),
-                ("ThrusterForcesSub.inputs:messageName", msg_type),
-            ],
-        },
-    )
-    thruster_forces_attr = og.Controller.attribute(
-        f"{thruster_graph_path}/ThrusterForcesSub.outputs:data"
-    )
+    thruster_forces_attr = None
+    if not sitl_enabled:
+        thruster_graph_path = "/ROS2ThrusterForcesGraph"
+        og.Controller.edit(
+            {"graph_path": thruster_graph_path, "evaluator_name": "execution"},
+            {
+                keys.CREATE_NODES: [
+                    ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                    ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                    ("ThrusterForcesSub", "isaacsim.ros2.bridge.ROS2Subscriber"),
+                ],
+                keys.CONNECT: [
+                    ("OnPlaybackTick.outputs:tick", "ThrusterForcesSub.inputs:execIn"),
+                    ("ROS2Context.outputs:context", "ThrusterForcesSub.inputs:context"),
+                ],
+                keys.SET_VALUES: [
+                    ("ThrusterForcesSub.inputs:topicName", forces_topic),
+                    ("ThrusterForcesSub.inputs:nodeNamespace", ros_namespace),
+                    ("ThrusterForcesSub.inputs:queueSize", queue_size),
+                    ("ThrusterForcesSub.inputs:messagePackage", "std_msgs"),
+                    ("ThrusterForcesSub.inputs:messageSubfolder", "msg"),
+                    ("ThrusterForcesSub.inputs:messageName", msg_type),
+                ],
+            },
+        )
+        thruster_forces_attr = og.Controller.attribute(
+            f"{thruster_graph_path}/ThrusterForcesSub.outputs:data"
+        )
+
+    sitl_link = None
+    sitl_thrust_model = None
+    sitl_sensor_injector = None
+    sitl_forces = np.zeros(num_thrusters, dtype=float)
+    if sitl_enabled:
+        thrust_curve_path = _resolve_path(str(sitl_cfg["thrust_curve_csv"]), config_root)
+        sitl_thrust_model = T200ThrustModel(
+            thrust_curve_path,
+            voltage_v=float(sitl_cfg["battery_voltage_v"]),
+            servo_channels=sitl_cfg["mvm_thruster_servo_channels"],
+            direction_multipliers=sitl_cfg["mvm_thruster_directions"],
+            pwm_min=int(sitl_cfg.get("pwm_min", 1100)),
+            pwm_neutral=int(sitl_cfg.get("pwm_neutral", 1500)),
+            pwm_max=int(sitl_cfg.get("pwm_max", 1900)),
+        )
+        if len(sitl_thrust_model.servo_channels) != num_thrusters:
+            raise ValueError(
+                "control.ardusub_sitl motor mapping must match the MVM thruster count "
+                f"({num_thrusters})"
+            )
+        sitl_link = ArduSubJsonLink(
+            str(sitl_cfg["bind_address"]),
+            int(sitl_cfg["json_port"]),
+        )
+        sitl_sensor_injector = MavlinkSensorInjector(
+            str(sitl_cfg["mavlink_sensor_endpoint"]),
+            system_id=int(sitl_cfg.get("mavlink_system_id", 43)),
+            component_id=int(sitl_cfg.get("mavlink_component_id", 197)),
+        )
+        print(
+            "[ArduSub SITL] JSON backend listening on "
+            f"{sitl_cfg['bind_address']}:{sitl_cfg['json_port']}; ROS force input disabled"
+        )
 
     # 3) Attach OceanSim camera and publish the selected image outputs.
     uw_camera_cfg = sensors_cfg["uw_camera"]
@@ -1225,7 +1308,8 @@ def main() -> None:
     baro_cfg = sensors_cfg.get("barometer", {})
     magnetometer_cfg = sensors_cfg.get("magnetometer", {})
     pose_graph_path = "/ROS2PoseGraph"
-    pose_frame_id = robot_prim_path.rsplit("/", 1)[-1] or "base_link"
+    pose_frame_id = str(robot_cfg.get("ros2_frame_id", robot_prim_path.rsplit("/", 1)[-1] or "base_link"))
+    world_frame_id = str(robot_cfg.get("world_frame_id", "World"))
     pose_topic = str(robot_cfg["pose_topic"]).strip()
     velocity_topic = str(robot_cfg["velocity_topic"]).strip()
     acceleration_topic = str(robot_cfg["acceleration_topic"]).strip()
@@ -1299,7 +1383,7 @@ def main() -> None:
     ]
     tf_set_values = [
         ("ReadSimTime.inputs:resetOnStop", False),
-        ("PublishBaseTF.inputs:parentFrameId", "World"),
+        ("PublishBaseTF.inputs:parentFrameId", world_frame_id),
         ("PublishBaseTF.inputs:childFrameId", pose_frame_id),
         ("PublishBaseTF.inputs:nodeNamespace", ros_namespace),
         ("PublishBaseTF.inputs:qosProfile", tf_qos_profile),
@@ -1312,44 +1396,6 @@ def main() -> None:
         ("ReadSimTime.outputs:simulationTime", "PublishBaseTF.inputs:timeStamp"),
         ("ROS2Context.outputs:context", "PublishBaseTF.inputs:context"),
     ]
-    if rtx_lidar_enabled and rtx_lidar_frame_id is not None:
-        lidar_translation = vec3(rtx_lidar_cfg["translation"], "sensors.rtx_lidar.translation")
-        lidar_orientation_wxyz = quat_wxyz_from_rpy_deg(
-            rtx_lidar_cfg["orientation_rpy_deg"],
-            "sensors.rtx_lidar.orientation_rpy_deg",
-        )
-        tf_nodes_to_create.append(("PublishRtxLidarTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
-        tf_set_values.extend(
-            [
-                ("PublishRtxLidarTF.inputs:parentFrameId", pose_frame_id),
-                ("PublishRtxLidarTF.inputs:childFrameId", rtx_lidar_frame_id),
-                (
-                    "PublishRtxLidarTF.inputs:translation",
-                    [float(lidar_translation[0]), float(lidar_translation[1]), float(lidar_translation[2])],
-                ),
-                (
-                    "PublishRtxLidarTF.inputs:rotation",
-                    [
-                        float(lidar_orientation_wxyz[1]),
-                        float(lidar_orientation_wxyz[2]),
-                        float(lidar_orientation_wxyz[3]),
-                        float(lidar_orientation_wxyz[0]),
-                    ],
-                ),
-                ("PublishRtxLidarTF.inputs:nodeNamespace", ros_namespace),
-                ("PublishRtxLidarTF.inputs:qosProfile", tf_qos_profile),
-                ("PublishRtxLidarTF.inputs:queueSize", queue_size),
-                ("PublishRtxLidarTF.inputs:topicName", "/tf"),
-                ("PublishRtxLidarTF.inputs:staticPublisher", False),
-            ]
-        )
-        tf_connections.extend(
-            [
-                ("BaseTFImpulse.outputs:execOut", "PublishRtxLidarTF.inputs:execIn"),
-                ("ReadSimTime.outputs:simulationTime", "PublishRtxLidarTF.inputs:timeStamp"),
-                ("ROS2Context.outputs:context", "PublishRtxLidarTF.inputs:context"),
-            ]
-        )
     og.Controller.edit(
         {"graph_path": tf_graph_path, "evaluator_name": "execution"},
         {
@@ -1373,6 +1419,18 @@ def main() -> None:
     static_tf_connections = []
 
     static_tf_specs: list[tuple[str, str, list[float], list[float]]] = []
+    if rtx_lidar_enabled and rtx_lidar_frame_id is not None:
+        static_tf_specs.append(
+            (
+                "RtxLidarTF",
+                rtx_lidar_frame_id,
+                vec3(rtx_lidar_cfg["translation"], "sensors.rtx_lidar.translation"),
+                quat_wxyz_from_rpy_deg(
+                    rtx_lidar_cfg["orientation_rpy_deg"],
+                    "sensors.rtx_lidar.orientation_rpy_deg",
+                ),
+            )
+        )
     if bool(uw_camera_cfg["enabled"]):
         static_tf_specs.append(
             (
@@ -1517,7 +1575,7 @@ def main() -> None:
                 ("PublishVelocity.inputs:topicName", velocity_topic),
                 ("PublishVelocity.inputs:messagePackage", "geometry_msgs"),
                 ("PublishVelocity.inputs:messageSubfolder", "msg"),
-                ("PublishVelocity.inputs:messageName", "Twist"),
+                ("PublishVelocity.inputs:messageName", "TwistStamped"),
                 ("PublishVelocity.inputs:nodeNamespace", ros_namespace),
                 ("PublishVelocity.inputs:queueSize", queue_size),
             ],
@@ -1529,15 +1587,19 @@ def main() -> None:
     simulation_app.update()
     velocity_pub_node = og.Controller.node(f"{velocity_graph_path}/PublishVelocity")
     velocity_pub_attrs = {attr.get_name(): attr for attr in velocity_pub_node.get_attributes()}
+    velocity_attr_header = velocity_pub_attrs.get("inputs:header")
+    velocity_attr_frame_id = velocity_pub_attrs.get("inputs:header:frame_id")
+    velocity_attr_stamp_sec = velocity_pub_attrs.get("inputs:header:stamp:sec")
+    velocity_attr_stamp_nsec = velocity_pub_attrs.get("inputs:header:stamp:nanosec")
     velocity_attr_twist = velocity_pub_attrs.get("inputs:twist")
-    velocity_attr_linear = velocity_pub_attrs.get("inputs:linear")
-    velocity_attr_angular = velocity_pub_attrs.get("inputs:angular")
-    velocity_attr_linear_x = velocity_pub_attrs.get("inputs:linear:x")
-    velocity_attr_linear_y = velocity_pub_attrs.get("inputs:linear:y")
-    velocity_attr_linear_z = velocity_pub_attrs.get("inputs:linear:z")
-    velocity_attr_angular_x = velocity_pub_attrs.get("inputs:angular:x")
-    velocity_attr_angular_y = velocity_pub_attrs.get("inputs:angular:y")
-    velocity_attr_angular_z = velocity_pub_attrs.get("inputs:angular:z")
+    velocity_attr_linear = velocity_pub_attrs.get("inputs:twist:linear")
+    velocity_attr_angular = velocity_pub_attrs.get("inputs:twist:angular")
+    velocity_attr_linear_x = velocity_pub_attrs.get("inputs:twist:linear:x")
+    velocity_attr_linear_y = velocity_pub_attrs.get("inputs:twist:linear:y")
+    velocity_attr_linear_z = velocity_pub_attrs.get("inputs:twist:linear:z")
+    velocity_attr_angular_x = velocity_pub_attrs.get("inputs:twist:angular:x")
+    velocity_attr_angular_y = velocity_pub_attrs.get("inputs:twist:angular:y")
+    velocity_attr_angular_z = velocity_pub_attrs.get("inputs:twist:angular:z")
 
     acceleration_graph_path = "/ROS2AccelerationGraph"
     og.Controller.edit(
@@ -1551,7 +1613,7 @@ def main() -> None:
                 ("PublishAcceleration.inputs:topicName", acceleration_topic),
                 ("PublishAcceleration.inputs:messagePackage", "geometry_msgs"),
                 ("PublishAcceleration.inputs:messageSubfolder", "msg"),
-                ("PublishAcceleration.inputs:messageName", "Twist"),
+                ("PublishAcceleration.inputs:messageName", "TwistStamped"),
                 ("PublishAcceleration.inputs:nodeNamespace", ros_namespace),
                 ("PublishAcceleration.inputs:queueSize", queue_size),
             ],
@@ -1563,15 +1625,19 @@ def main() -> None:
     simulation_app.update()
     acceleration_pub_node = og.Controller.node(f"{acceleration_graph_path}/PublishAcceleration")
     acceleration_pub_attrs = {attr.get_name(): attr for attr in acceleration_pub_node.get_attributes()}
+    acceleration_attr_header = acceleration_pub_attrs.get("inputs:header")
+    acceleration_attr_frame_id = acceleration_pub_attrs.get("inputs:header:frame_id")
+    acceleration_attr_stamp_sec = acceleration_pub_attrs.get("inputs:header:stamp:sec")
+    acceleration_attr_stamp_nsec = acceleration_pub_attrs.get("inputs:header:stamp:nanosec")
     acceleration_attr_twist = acceleration_pub_attrs.get("inputs:twist")
-    acceleration_attr_linear = acceleration_pub_attrs.get("inputs:linear")
-    acceleration_attr_angular = acceleration_pub_attrs.get("inputs:angular")
-    acceleration_attr_linear_x = acceleration_pub_attrs.get("inputs:linear:x")
-    acceleration_attr_linear_y = acceleration_pub_attrs.get("inputs:linear:y")
-    acceleration_attr_linear_z = acceleration_pub_attrs.get("inputs:linear:z")
-    acceleration_attr_angular_x = acceleration_pub_attrs.get("inputs:angular:x")
-    acceleration_attr_angular_y = acceleration_pub_attrs.get("inputs:angular:y")
-    acceleration_attr_angular_z = acceleration_pub_attrs.get("inputs:angular:z")
+    acceleration_attr_linear = acceleration_pub_attrs.get("inputs:twist:linear")
+    acceleration_attr_angular = acceleration_pub_attrs.get("inputs:twist:angular")
+    acceleration_attr_linear_x = acceleration_pub_attrs.get("inputs:twist:linear:x")
+    acceleration_attr_linear_y = acceleration_pub_attrs.get("inputs:twist:linear:y")
+    acceleration_attr_linear_z = acceleration_pub_attrs.get("inputs:twist:linear:z")
+    acceleration_attr_angular_x = acceleration_pub_attrs.get("inputs:twist:angular:x")
+    acceleration_attr_angular_y = acceleration_pub_attrs.get("inputs:twist:angular:y")
+    acceleration_attr_angular_z = acceleration_pub_attrs.get("inputs:twist:angular:z")
 
     baro_enabled = bool(baro_cfg.get("enabled", False))
     baro_pub_node = None
@@ -1787,6 +1853,7 @@ def main() -> None:
             3,
         ),
     }
+    imu_state_initial = {name: value.copy() for name, value in imu_state.items()}
 
     imu_graph_path = "/ROS2IMUGraph"
     og.Controller.edit(
@@ -2024,6 +2091,10 @@ def main() -> None:
 
     prev_lin_world = np.zeros(3, dtype=float)
     prev_ang_world = np.zeros(3, dtype=float)
+    sitl_origin_enu = np.asarray(robot_cfg["translation"], dtype=float).reshape(3)
+    sitl_waiting_for_reconnect = False
+    sitl_reset_requested = False
+    sitl_last_dvl_valid = False
 
     def _read_state() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
         sim_pos, sim_ori = rov_rigid.get_world_poses()
@@ -2058,6 +2129,8 @@ def main() -> None:
         return pose_vec, v_body, lin_accel_body, ang_accel_body, R
 
     def _select_forces() -> np.ndarray:
+        if sitl_enabled:
+            return np.asarray(sitl_forces, dtype=float)
         forces = forces_default
         if thruster_forces_attr is not None:
             data = thruster_forces_attr.get()
@@ -2066,6 +2139,67 @@ def main() -> None:
                 if latest.size == num_thrusters:
                     forces = latest
         return np.asarray(forces, dtype=float)
+
+    def _accept_sitl_packet(received) -> None:
+        if sitl_thrust_model is None:
+            return
+        mapped = sitl_thrust_model.forces_from_servos(received.packet.pwm)
+        if mapped.size != num_thrusters:
+            raise RuntimeError(
+                f"ArduSub produced {mapped.size} mapped thrusters; MVM expects {num_thrusters}"
+            )
+        sitl_forces[:] = mapped
+        if received.skipped_frames:
+            print(
+                f"[ArduSub SITL warning] skipped {received.skipped_frames} servo frame(s) "
+                f"before frame {received.packet.frame_count}"
+            )
+
+    def _build_sitl_fdm_state(
+        pos: np.ndarray,
+        q: np.ndarray,
+        lin_world: np.ndarray,
+        v_body: np.ndarray,
+        lin_accel_body: np.ndarray,
+        R: np.ndarray,
+    ) -> dict:
+        gravity = float(sitl_cfg.get("gravity_m_s2", 9.80665))
+        gravity_enu = np.array([0.0, 0.0, -gravity], dtype=float)
+        specific_force_flu = lin_accel_body - R.T @ gravity_enu
+        return build_fdm_payload(
+            timestamp_s=sim_time_seconds,
+            gyro_frd=body_flu_to_frd(v_body[3:]),
+            accel_body_frd=body_flu_to_frd(specific_force_flu),
+            position_ned=enu_position_to_ned(
+                pos,
+                sitl_origin_enu,
+                float(sitl_cfg["water_surface_z"]),
+            ),
+            quaternion_ned_frd=orientation_enu_flu_to_ned_frd(q),
+            velocity_ned=enu_vector_to_ned(lin_world),
+            battery_voltage_v=float(sitl_cfg["battery_voltage_v"]),
+            battery_current_a=float(sitl_cfg.get("battery_current_a", 0.0)),
+        )
+
+    def _reset_sitl_runtime_state() -> None:
+        nonlocal callback_counter, sim_time_seconds
+        nonlocal baro_next_pub_time, magnetometer_next_pub_time, imu_next_pub_time
+        nonlocal dvl_dropout_until_time, dvl_last_dropout_start_time, sitl_last_dvl_valid
+        callback_counter = 0
+        sim_time_seconds = 0.0
+        prev_lin_world.fill(0.0)
+        prev_ang_world.fill(0.0)
+        last_sample_stamp_ns.clear()
+        baro_next_pub_time = -1.0
+        magnetometer_next_pub_time = -1.0
+        imu_next_pub_time = -1.0
+        dvl_dropout_until_time = -1.0
+        dvl_last_dropout_start_time = 0.0
+        sitl_last_dvl_valid = False
+        for name, value in imu_state.items():
+            value[:] = imu_state_initial[name]
+        for value in magnetometer_stochastic_state.values():
+            value.fill(0.0)
 
     def _compute_tau(v_body: np.ndarray, pose_vec: np.ndarray, forces: np.ndarray) -> np.ndarray:
         mvm.update_model(v_body, pose_vec)
@@ -2105,6 +2239,7 @@ def main() -> None:
         nonlocal baro_next_pub_time, callback_counter, imaging_sonar_tick, render_this_step_flag, sim_time_seconds
         nonlocal dvl_dropout_until_time, dvl_last_dropout_start_time
         nonlocal imu_next_pub_time, magnetometer_next_pub_time
+        nonlocal sitl_waiting_for_reconnect, sitl_reset_requested, sitl_last_dvl_valid
         try:
             sim_time_seconds = _read_simulation_time()
             clock_timestamp_attr.set(_record_sample_time("clock", sim_time_seconds))
@@ -2124,13 +2259,13 @@ def main() -> None:
                     pose_attr_header.set(
                         json.dumps(
                             {
-                                "frame_id": pose_frame_id,
+                                "frame_id": world_frame_id,
                                 "stamp": {"sec": sec, "nanosec": nanosec},
                             }
                         )
                     )
                 if pose_attr_frame_id is not None:
-                    pose_attr_frame_id.set(pose_frame_id)
+                    pose_attr_frame_id.set(world_frame_id)
                 if pose_attr_stamp_sec is not None:
                     pose_attr_stamp_sec.set(sec)
                 if pose_attr_stamp_nsec is not None:
@@ -2175,7 +2310,7 @@ def main() -> None:
                 base_tf_rotation_attr.set([float(q[1]), float(q[2]), float(q[3]), float(q[0])])
             if base_tf_publish_impulse_attr is not None:
                 base_tf_publish_impulse_attr.set(True)
-            if baro_enabled and baro_pub_node is not None:
+            if publish_firmware_sensor_inputs_ros and baro_enabled and baro_pub_node is not None:
                 sim_time = sim_time_seconds
                 baro_publish_due, baro_next_pub_time = _advance_publication_deadline(
                     sim_time,
@@ -2221,7 +2356,7 @@ def main() -> None:
                         baro_publish_impulse_attr.set(True)
                         og.Controller.evaluate_sync(baro_graph)
                         sensor_publish_counts["barometer"] += 1
-            if magnetometer_enabled and magnetometer_pub_node is not None:
+            if publish_firmware_sensor_inputs_ros and magnetometer_enabled and magnetometer_pub_node is not None:
                 sim_time = sim_time_seconds
                 magnetometer_publish_due, magnetometer_next_pub_time = _advance_publication_deadline(
                     sim_time,
@@ -2330,10 +2465,11 @@ def main() -> None:
                     dvl_dropout_until_time = sim_time + dvl_min_dropout_duration_s
                     sensor_publish_counts["dvl_dropouts"] += 1
                 dvl_drop_active = sim_time < dvl_dropout_until_time
-                if (not dvl_drop_active) and (
+                dvl_valid_for_mavlink = (not dvl_drop_active) and (
                     (not dvl_require_bottom_lock and not dvl_beam_dropout)
                     or (dvl_require_bottom_lock and dvl_valid_bottom_lock)
-                ) and dvl_altitude_m is not None:
+                ) and dvl_altitude_m is not None
+                if dvl_valid_for_mavlink:
                     sec, nanosec = _sample_header_stamp("dvl", sim_time)
                     body_rotation = rotation_matrix_from_quat(q)
                     angular_velocity_body = body_rotation.T @ ang_world
@@ -2347,6 +2483,32 @@ def main() -> None:
                         float(dvl_velocity_sensor[2]),
                     ]
                     dvl_angular_velocity = [0.0, 0.0, 0.0]
+                    if sitl_sensor_injector is not None:
+                        dvl_velocity_body_origin = (
+                            dvl_rotation_body_from_sensor @ dvl_velocity_sensor
+                            - np.cross(angular_velocity_body, dvl_translation_body)
+                        )
+                        dvl_sent = sitl_sensor_injector.send_odometry(
+                            timestamp_s=sim_time,
+                            position_ned=enu_position_to_ned(
+                                pos,
+                                sitl_origin_enu,
+                                float(sitl_cfg["water_surface_z"]),
+                            ),
+                            quaternion_ned_frd=orientation_enu_flu_to_ned_frd(q),
+                            velocity_body_frd=body_flu_to_frd(dvl_velocity_body_origin),
+                            velocity_variance=float(dvl_cfg.get("vel_cov", 0.0025)),
+                            quality=100,
+                        )
+                        if dvl_sent:
+                            sitl_sensor_injector.send_distance(
+                                timestamp_s=sim_time,
+                                distance_m=dvl_altitude_m,
+                                min_distance_m=float(dvl_cfg.get("min_range_m", 0.05)),
+                                max_distance_m=float(dvl_cfg.get("max_range_m", 50.0)),
+                                signal_quality=100,
+                            )
+                            sitl_last_dvl_valid = True
                     if dvl_attr_header is not None:
                         dvl_attr_header.set(
                             json.dumps(
@@ -2413,14 +2575,51 @@ def main() -> None:
                         if dvl_attr_covariance is not None:
                             dvl_attr_covariance.set(dvl_twist_covariance)
                     dvl_altitude_attr_data.set(dvl_altitude_m)
-                    if dvl_publish_impulse_attr is not None:
+                    if publish_firmware_sensor_inputs_ros and dvl_publish_impulse_attr is not None:
                         dvl_publish_impulse_attr.set(True)
                         og.Controller.evaluate_sync(dvl_graph)
                         sensor_publish_counts["dvl_messages"] += 1
                         sensor_publish_counts["dvl_altitude_messages"] += 1
+                elif sitl_sensor_injector is not None and sitl_last_dvl_valid:
+                    invalid_sent = sitl_sensor_injector.send_odometry(
+                        timestamp_s=sim_time,
+                        position_ned=enu_position_to_ned(
+                            pos,
+                            sitl_origin_enu,
+                            float(sitl_cfg["water_surface_z"]),
+                        ),
+                        quaternion_ned_frd=orientation_enu_flu_to_ned_frd(q),
+                        velocity_body_frd=[0.0, 0.0, 0.0],
+                        velocity_variance=float(dvl_cfg.get("vel_cov", 0.0025)),
+                        quality=-1,
+                    )
+                    if invalid_sent:
+                        sitl_last_dvl_valid = False
             pose_vec, v_body, lin_accel_body, ang_accel_body, R = _compute_kinematics(
                 pos, q, lin_world, ang_world
             )
+            if (
+                sitl_enabled
+                and callback_counter > 0
+                and not sitl_waiting_for_reconnect
+                and not sitl_reset_requested
+            ):
+                sitl_link.send_state(
+                    _build_sitl_fdm_state(pos, q, lin_world, v_body, lin_accel_body, R)
+                )
+                received = sitl_link.receive_new(float(sitl_cfg["packet_timeout_s"]))
+                if received is None:
+                    sitl_forces.fill(0.0)
+                    sitl_waiting_for_reconnect = True
+                    timeline.pause()
+                    print("[ArduSub SITL warning] servo link timed out; neutral thrust and pause requested")
+                elif received.restarted:
+                    sitl_forces.fill(0.0)
+                    sitl_reset_requested = True
+                    timeline.pause()
+                    print("[ArduSub SITL] detected restarted firmware; simulation reset requested")
+                else:
+                    _accept_sitl_packet(received)
             sim_time = sim_time_seconds
             imu_publish_due, imu_next_pub_time = _advance_publication_deadline(
                 sim_time,
@@ -2545,10 +2744,26 @@ def main() -> None:
                     imu_attr_angular_velocity_covariance.set(imu_angular_velocity_covariance)
                 if imu_attr_linear_acceleration_covariance is not None:
                     imu_attr_linear_acceleration_covariance.set(imu_linear_acceleration_covariance)
-                if imu_publish_impulse_attr is not None:
+                if publish_firmware_sensor_inputs_ros and imu_publish_impulse_attr is not None:
                     imu_publish_impulse_attr.set(True)
                     og.Controller.evaluate_sync(imu_graph)
                     sensor_publish_counts["imu"] += 1
+            velocity_sec, velocity_nanosec = _sample_header_stamp("velocity", sim_time_seconds)
+            if velocity_attr_header is not None:
+                velocity_attr_header.set(
+                    json.dumps(
+                        {
+                            "frame_id": pose_frame_id,
+                            "stamp": {"sec": velocity_sec, "nanosec": velocity_nanosec},
+                        }
+                    )
+                )
+            if velocity_attr_frame_id is not None:
+                velocity_attr_frame_id.set(pose_frame_id)
+            if velocity_attr_stamp_sec is not None:
+                velocity_attr_stamp_sec.set(velocity_sec)
+            if velocity_attr_stamp_nsec is not None:
+                velocity_attr_stamp_nsec.set(velocity_nanosec)
             if velocity_attr_twist is not None:
                 velocity_attr_twist.set(
                     json.dumps(
@@ -2585,6 +2800,27 @@ def main() -> None:
                         velocity_attr_angular_y.set(float(v_body[4]))
                     if velocity_attr_angular_z is not None:
                         velocity_attr_angular_z.set(float(v_body[5]))
+            acceleration_sec, acceleration_nanosec = _sample_header_stamp(
+                "acceleration", sim_time_seconds
+            )
+            if acceleration_attr_header is not None:
+                acceleration_attr_header.set(
+                    json.dumps(
+                        {
+                            "frame_id": pose_frame_id,
+                            "stamp": {
+                                "sec": acceleration_sec,
+                                "nanosec": acceleration_nanosec,
+                            },
+                        }
+                    )
+                )
+            if acceleration_attr_frame_id is not None:
+                acceleration_attr_frame_id.set(pose_frame_id)
+            if acceleration_attr_stamp_sec is not None:
+                acceleration_attr_stamp_sec.set(acceleration_sec)
+            if acceleration_attr_stamp_nsec is not None:
+                acceleration_attr_stamp_nsec.set(acceleration_nanosec)
             if acceleration_attr_twist is not None:
                 acceleration_attr_twist.set(
                     json.dumps(
@@ -2638,6 +2874,19 @@ def main() -> None:
 
     simulation_app.update()
     world.reset()
+    if sitl_enabled:
+        print("[ArduSub SITL] waiting for the first servo packet before starting physics")
+        first_frame = None
+        while simulation_app.is_running() and first_frame is None:
+            first_frame = sitl_link.receive_new(0.05)
+            simulation_app.update()
+        if first_frame is None:
+            raise RuntimeError("Isaac Sim stopped before ArduSub connected")
+        _accept_sitl_packet(first_frame)
+        print(
+            f"[ArduSub SITL] connected at frame {first_frame.packet.frame_count}, "
+            f"requested rate {first_frame.packet.frame_rate} Hz"
+        )
     world.play()
     import omni.timeline
 
@@ -2700,6 +2949,57 @@ def main() -> None:
             last_render_sample_time = _read_simulation_time()
             step_ms = (time.perf_counter() - step_start) * 1000.0
             render_this_step_flag = False
+
+            if sitl_enabled and (sitl_waiting_for_reconnect or sitl_reset_requested):
+                world.pause()
+                sitl_forces.fill(0.0)
+                print("[ArduSub SITL] physics paused; waiting for a fresh servo frame")
+                recovered = None
+                if sitl_waiting_for_reconnect and not sitl_reset_requested:
+                    while simulation_app.is_running() and recovered is None:
+                        recovered = sitl_link.receive_new(0.05)
+                        simulation_app.update()
+                    if recovered is None:
+                        break
+                    sitl_reset_requested = recovered.restarted
+
+                if sitl_reset_requested:
+                    world.reset()
+                    _reset_sitl_runtime_state()
+                    print("[ArduSub SITL] Isaac world and sensor state reset")
+                    reset_state = _read_state()
+                    if reset_state is None:
+                        raise RuntimeError("Unable to read Isaac state after SITL restart")
+                    reset_pos, reset_q, reset_lin_world, reset_ang_world = reset_state
+                    reset_R = rotation_matrix_from_quat(reset_q)
+                    reset_v_body = np.concatenate(
+                        (reset_R.T @ reset_lin_world, reset_R.T @ reset_ang_world)
+                    )
+                    sim_time_seconds = _read_simulation_time()
+                    sitl_link.send_state(
+                        _build_sitl_fdm_state(
+                            reset_pos,
+                            reset_q,
+                            reset_lin_world,
+                            reset_v_body,
+                            np.zeros(3, dtype=float),
+                            reset_R,
+                        )
+                    )
+                    recovered = None
+                    while simulation_app.is_running() and recovered is None:
+                        recovered = sitl_link.receive_new(0.05)
+                        simulation_app.update()
+                    if recovered is None:
+                        break
+
+                _accept_sitl_packet(recovered)
+                sitl_waiting_for_reconnect = False
+                sitl_reset_requested = False
+                world.play()
+                if not timeline.is_playing():
+                    timeline.play()
+                print(f"[ArduSub SITL] link resumed at frame {recovered.packet.frame_count}")
 
             loop_ms = (time.perf_counter() - loop_start) * 1000.0
             if realtime:
@@ -2832,6 +3132,10 @@ def main() -> None:
             main_loop_frame += 1
     finally:
         world.remove_physics_callback("mvm_dynamics")
+        if sitl_sensor_injector is not None:
+            sitl_sensor_injector.close()
+        if sitl_link is not None:
+            sitl_link.close()
         if imaging_sonar is not None:
             imaging_sonar.close()
         if uw_camera is not None:

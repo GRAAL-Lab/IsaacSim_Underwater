@@ -204,7 +204,188 @@ After extracting, you should see files like:
 
 ## Quickstart: run the simulation
 
-### 1) One-time environment setup (per terminal)
+### ArduSub SITL control
+
+The SITL profile keeps Isaac as the hydrodynamics and sensor simulator while
+stock ArduSub owns arming, flight modes, estimation, and motor mixing. It uses
+ArduPilot's JSON backend on UDP 9002; ROS 2 is not in the motor feedback loop.
+
+The data path is:
+
+```text
+ROS commands -> bridge UDP 14551 -> ArduSub
+ArduSub servo PWM -> JSON UDP 9002 -> Isaac/MVM thrusters
+Isaac state -> JSON UDP 9002 -> ArduSub simulated IMU
+Isaac DVL/range -> MAVLink UDP 14552 -> ArduSub EKF3
+```
+
+All vehicle topics and services use `/auv/*`; `/clock` and `/tf` remain global
+ROS infrastructure topics. Isaac always publishes ground-truth state on
+`/auv/pose_actual`, `/auv/velocity_actual`, and `/auv/acceleration_actual`.
+In ArduSub mode, Isaac does not duplicate IMU, magnetometer, pressure, DVL, or
+DVL altitude on ROS; those sensor measurements are injected into ArduSub over
+JSON/MAVLink. The bridge publishes the firmware EKF velocity separately on
+`/auv/velocity_estimate`. Isaac still publishes sensors that are not sent to
+firmware, such as camera and sonar.
+
+#### One-time SITL setup
+
+The launch script deliberately accepts only an unmodified ArduPilot `Sub-4.7.2`
+checkout at commit `fb773567896014da007bca58358704d4a0d8516f`.
+
+Set the global starting position in
+`config/ardusub_sitl.overlay.json` under `control.ardusub_sitl.home`:
+
+```json
+"home": {
+  "latitude_deg": 63.440791,
+  "longitude_deg": 10.348857,
+  "altitude_m": 0.0,
+  "heading_deg": 0.0
+}
+```
+
+The ArduSub launcher validates these values and passes them to
+`sim_vehicle.py --custom-location`. Isaac coordinates remain local ENU relative
+to this global home; ArduSub exposes the corresponding global position through
+MAVLink.
+
+For the SITL profile, `GPS1_TYPE=1` enables ArduPilot's simulated GPS only to
+establish that WGS-84 origin and make the vehicle visible on QGroundControl's
+map. The EKF navigation sources remain ExternalNav: `EK3_SRC1_POSXY=6` uses the
+local NED position in Isaac's MAVLink `ODOMETRY`, and `EK3_SRC1_VELXY=6` uses
+the DVL-derived velocity in the same message. The simulated GPS is therefore
+not used to control Position Hold.
+
+```bash
+cd /home/attia/Isaac
+
+# Skip this clone if /home/attia/Isaac/ardupilot already exists.
+git clone --branch Sub-4.7.2 --depth 1 --recurse-submodules --shallow-submodules \
+  https://github.com/ArduPilot/ardupilot.git ardupilot
+
+cd /home/attia/Isaac/ardupilot
+git rev-parse HEAD
+./waf configure --board sitl
+./waf build --target bin/ardusub -j"$(nproc)"
+
+# Host-Python MAVProxy environment used by sim_vehicle.py.
+python3 -m venv /home/attia/Isaac/ardupilot-venv
+/home/attia/Isaac/ardupilot-venv/bin/python -m pip install MAVProxy
+
+# MAVLink sender used inside Isaac Sim's Python 3.11 runtime.
+cd /home/attia/Isaac/IsaacSim_Underwater
+export ISAACSIM_ROOT=/home/attia/Isaac/isaac-sim-standalone-5.1.0-linux-x86_64
+"$ISAACSIM_ROOT/python.sh" -m pip install -r requirements-sitl.txt
+
+# Build the ROS 2 bridge after pulling these source changes.
+cd /home/attia/ros2_ws
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select bridge --symlink-install
+```
+
+If MAVProxy is stored somewhere other than the sibling
+`/home/attia/Isaac/ardupilot-venv`, export `ARDUPILOT_VENV` before launching
+ArduSub.
+
+#### Run the complete system
+
+Run Isaac and ArduSub together with the stack launcher:
+
+```bash
+cd /home/attia/Isaac/IsaacSim_Underwater
+./scripts/run_ardusub_isaac_stack.sh
+```
+
+The launcher derives defaults from the repository location:
+
+- ArduPilot: sibling directory `ardupilot`
+- MAVProxy environment: sibling directory `ardupilot-venv`
+- Isaac Sim: newest sibling directory matching `isaac-sim-standalone-5.1.*`
+- OceanSim: `$ISAACSIM_ROOT/extsUser/OceanSim`
+- MVM: `$HOME/graal_ws/marine_vehicle_models/underwater_vehicle_model/build_isaac_py311`
+
+This makes the script portable when the repositories use the documented
+layout. For any different layout, export one or more of `ARDUPILOT_ROOT`,
+`ARDUPILOT_VENV`, `ISAACSIM_ROOT`, `OCEANSIM_ROOT`, and `MVM_PY_PATH` before
+running it. Values written as `/path/to/...` are placeholders and must not be
+copied literally; the launcher ignores them if they were accidentally
+exported. The launcher starts Isaac first, waits for UDP 9002, starts
+ArduSub, and stops both processes when you press `Ctrl-C`.
+
+The launcher exposes two public MAVLink endpoints: UDP `14550` for
+QGroundControl and UDP `14551` for the ROS 2 bridge. Override them with
+`QGC_MAVLINK_PORT` and `BRIDGE_MAVLINK_PORT` if needed. UDP `14552` is not a
+third GCS endpoint; it is the private bidirectional transport used by Isaac to
+inject DVL `ODOMETRY` and `DISTANCE_SENSOR` messages into stock ArduSub.
+
+Check path discovery without starting the simulator:
+
+```bash
+./scripts/run_ardusub_isaac_stack.sh --check
+```
+
+Expected firmware messages include `ArduSub V4.7.2`,
+`Frame: VECTORED_6DOF`, `ArduPilot Ready`, and `AHRS: EKF3 active`. Isaac should
+print `[ArduSub SITL] connected`. Before selecting Position Hold, wait for an
+EKF message stating that external navigation data is in use and for
+QGroundControl to display a position near `63.440791, 10.348857`.
+
+In a second terminal, start the ROS 2 MAVLink bridge:
+
+```bash
+cd /home/attia/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 launch bridge ardusub_sitl_bridge.launch.py
+```
+
+The bridge should report an autopilot heartbeat and accepted
+`SET_MESSAGE_INTERVAL` requests. The SITL profile requests
+`SCALED_PRESSURE2` at 200 Hz and publishes `/auv/pressure/scaled2` in pascals.
+The DVL `DISTANCE_SENSOR` field is converted from MAVLink centimetres and
+published on `/dvl/data` as `dvl_msgs/msg/DVL`, with `altitude` in metres. The
+MAVLink distance report does not contain DVL velocity or beam data, so the
+bridge sets `velocity_valid` to false.
+
+#### Verify the running system
+
+In a fourth ROS 2 terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/attia/ros2_ws/install/setup.bash
+
+# Confirm the single vehicle namespace.
+ros2 topic list | grep '^/auv/' | sort
+
+# This IMU message comes from ArduSub through the bridge, not directly from Isaac.
+ros2 topic echo /auv/imu/data_raw sensor_msgs/msg/Imu --once
+
+# Inspect the command and service endpoints.
+ros2 node info /mavlink_bridge
+```
+
+Optional stationary control test—keep the vehicle clear before arming:
+
+```bash
+ros2 service call /auv/service/flight_mode \
+  bleurov_core_helper/srv/SetFlightMode "{mode: 'STABILIZE'}"
+ros2 service call /auv/service/arming std_srvs/srv/SetBool "{data: true}"
+
+# Zero body-velocity command; Ctrl-C stops publication.
+ros2 topic pub -r 20 /auv/velocity_desired geometry_msgs/msg/TwistStamped \
+  "{header: {frame_id: 'auv_base_link'}, twist: {linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {z: 0.0}}}"
+
+# Disarm after the test.
+ros2 service call /auv/service/arming std_srvs/srv/SetBool "{data: false}"
+```
+
+Stop the bridge, ArduSub, and Isaac with `Ctrl-C`, preferably in that order.
+The normal ROS-only force-input mode below remains available when the SITL
+overlay is not supplied.
+
+### ROS-only simulation: one-time environment setup
 ```bash
 export ISAACSIM_ROOT=/path/to/isaac-sim-5.1
 export ISAAC_UW_ROOT=/path/to/IsaacSim_Underwater
@@ -218,7 +399,7 @@ unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION RMW_IMPLEMENTATION
 source "$ISAACSIM_ROOT/setup_ros_env.sh"
 ```
 
-### 2) Run
+### ROS-only simulation: run
 ```bash
 "$ISAACSIM_ROOT/python.sh" \
   "$ISAAC_UW_ROOT/run_underwater_sim.py" \
@@ -278,24 +459,24 @@ Thruster ordering and geometry are defined in `config/BlueROV.conf` (thruster po
 ### Sensors + ROS2
 The script sets up ROS2 graphs for:
 - **Pose** (PoseStamped): `robot.pose_topic` (default: `/auv/pose_actual`)
-- **Velocity** (Twist, body-frame): `robot.velocity_topic` (default: `/auv/velocity_actual`)
-- **Acceleration** (Twist, body-frame): `robot.acceleration_topic` (default: `/auv/acceleration_actual`)
+- **Velocity** (`geometry_msgs/msg/TwistStamped`, body-frame): `robot.velocity_topic` (default: `/auv/velocity_actual`)
+- **Acceleration** (`geometry_msgs/msg/TwistStamped`, body-frame): `robot.acceleration_topic` (default: `/auv/acceleration_actual`)
 - **TF** (OmniGraph / Isaac Sim ROS2 bridge):
   - dynamic `World -> BROV_low`
   - static `BROV_low ->` each enabled sensor frame (`uw_camera_link`, `imaging_sonar_link`, `rtx_lidar_link`, `imu_link`, `dvl_link`)
 - **Underwater RGB camera** (Image + CameraInfo):
-  - optional raw image: `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
-  - `sensors.uw_camera.ros2_camera_info_topic` (default: `/IsaacSim/uw_camera/camera_info`)
+  - optional raw image: `sensors.uw_camera.ros2_topic` (default: `/auv/camera/image_raw`)
+  - `sensors.uw_camera.ros2_camera_info_topic` (default: `/auv/camera/camera_info`)
   - processed underwater image (raw `sensor_msgs/Image`): `sensors.uw_camera.ros2_processed_topic`
-    - default: `/IsaacSim/uw_camera/processed`
+    - default: `/auv/camera/processed`
   - raw, processed, and camera-info publishers are controlled by `publish_raw`, `publish_processed`, and `publish_camera_info`; the default setup publishes only the processed 1080p image and camera info
 - **OceanSim 2D imaging sonar** (raw `sensor_msgs/Image`):
-  - `sensors.imaging_sonar.ros2_topic` (default: `/IsaacSim/imaging_sonar/image_raw`)
+  - `sensors.imaging_sonar.ros2_topic` (default: `/auv/imaging_sonar`)
   - `sensors.imaging_sonar.ros2_frame_id` (default: `imaging_sonar_link`)
 - **3D sonar** (`sensor_msgs/PointCloud2`):
-  - `sensors.rtx_lidar.ros2_topic` (default: `/IsaacSim/rtx_lidar/point_cloud`)
+  - `sensors.rtx_lidar.ros2_topic` (default: `/auv/sonar_point_cloud`)
   - `sensors.rtx_lidar.ros2_frame_id` (default: `rtx_lidar_link`)
-- **IMU** (sensor_msgs/Imu): `sensors.imu.ros2_topic` (default: `/IsaacSim/imu`)
+- **IMU** (sensor_msgs/Imu): `sensors.imu.ros2_topic` (default: `/auv/imu/data_raw`)
   - The simulator publishes a noisy IMU model using body kinematics plus gravity, configurable gyro/accelerometer noise density, bias random walk, orientation perturbation, and covariance fields. The default values are based on the Blue Robotics Navigator ICM-20602-style IMU.
 - **Magnetometer** (`sensor_msgs/msg/MagneticField`): `sensors.magnetometer.ros2_topic` (default: `/auv/imu/magnetic_field`)
   - The model rotates a configured ENU local magnetic field into the sensor frame and can apply hard iron bias, soft iron distortion, colored stochastic errors, saturation, and quantization.
@@ -348,7 +529,7 @@ Behavior:
 - frame skipping limits publication/post-processing frequency, but it does not make the RTX sensor render faster; the render product remains active because disabling it between 30 Hz camera frames prevents Isaac's asynchronous point-cloud annotator from completing
 - both low-frequency 3D sonar profiles use `scanRateBaseHz=6` and `reportRateBaseHz=6` for the experiment; Water Linked's current Sonar 3D-15 datasheet specifies 5 Hz in low-frequency mode, so 6 Hz is an intentional experimental setting rather than a manufacturer-exact value
 - `simulation.timing.render_fps=30` supplies the camera's 30 Hz cadence; the RTX lidar render product is independently gated to 6 Hz
-- the controller reports completed lidar renders without subscribing to the large `PointCloud2` topic; use `ros2 topic hz /sonar_point_cloud` to measure the final DDS delivery rate
+- the controller reports completed lidar renders without subscribing to the large `PointCloud2` topic; use `ros2 topic hz /auv/sonar_point_cloud` to measure the final DDS delivery rate
 
 ### Configured sensor rates
 
@@ -408,9 +589,9 @@ You only need to run the simulation:
 ```
 
 Camera topics:
-- optional raw RGB image: `sensors.uw_camera.ros2_topic` (default: `/IsaacSim/uw_camera/image_raw`)
-- camera info: `sensors.uw_camera.ros2_camera_info_topic` (default: `/IsaacSim/uw_camera/camera_info`)
-- processed underwater image: `sensors.uw_camera.ros2_processed_topic` (default: `/IsaacSim/uw_camera/processed`)
+- optional raw RGB image: `sensors.uw_camera.ros2_topic` (default: `/auv/camera/image_raw`)
+- camera info: `sensors.uw_camera.ros2_camera_info_topic` (default: `/auv/camera/camera_info`)
+- processed underwater image: `sensors.uw_camera.ros2_processed_topic` (default: `/auv/camera/processed`)
 
 The processed image is published as raw `sensor_msgs/Image`, so RViz2 can subscribe to it directly with a normal `Image` display. The default configuration sets `publish_raw=false`, `publish_processed=true`, `publish_camera_info=true`, and `ros2_queue_size=1` to avoid a second uncompressed 1080p image stream.
 
@@ -426,7 +607,7 @@ The 2D imaging sonar runs inside `run_underwater_sim.py` using OceanSim’s `Ima
 ![2D imaging sonar](docs/2Dsonar.png)
 
 Sonar topic:
-- imaging sonar image: `sensors.imaging_sonar.ros2_topic` (default: `/IsaacSim/imaging_sonar/image_raw`)
+- imaging sonar image: `sensors.imaging_sonar.ros2_topic` (default: `/auv/imaging_sonar`)
 
 The imaging sonar output is published as raw `sensor_msgs/Image`, so RViz2 can subscribe to it directly with a normal `Image` display.
 

@@ -1,8 +1,8 @@
 {
   "simulation": {
     "app": {
-      "headless": true,
-      "disable_viewport_updates": true,
+      "headless": false,
+      "disable_viewport_updates": false,
       "enable_motion_bvh": true,
       "dlss_exec_mode": 0
     },
@@ -50,10 +50,10 @@
         0.0
       ],
       "resolution": [
-        1920,
-        1080
+        1280,
+        720
       ],
-      "frequency_hz": 30.0,
+      "frequency_hz": 15.0,
       "publish_raw": false,
       "publish_processed": true,
       "publish_camera_info": true,
@@ -75,9 +75,9 @@
           0.2
         ]
       },
-      "ros2_topic": "/IsaacSim/uw_camera/image_raw",
-      "ros2_processed_topic": "/IsaacSim/uw_camera/processed",
-      "ros2_camera_info_topic": "/IsaacSim/uw_camera/camera_info",
+      "ros2_topic": "/auv/camera/image_raw",
+      "ros2_processed_topic": "/auv/camera/processed",
+      "ros2_camera_info_topic": "/auv/camera/camera_info",
       "ros2_frame_id": "uw_camera_link"
     },
     "imaging_sonar": {
@@ -116,7 +116,7 @@
         "central_peak": 2.0,
         "central_std": 0.001
       },
-      "ros2_topic": "/IsaacSim/imaging_sonar",
+      "ros2_topic": "/auv/imaging_sonar",
       "ros2_frame_id": "imaging_sonar_link"
     },
     "rtx_lidar": {
@@ -149,7 +149,7 @@
         "min_frame_skip_count": 0,
         "max_frame_skip_count": 120
       },
-      "show_debug_view": false
+      "show_debug_view": true
     },
     "dvl": {
       "enabled": true,

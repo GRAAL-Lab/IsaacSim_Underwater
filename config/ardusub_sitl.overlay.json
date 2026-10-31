@@ -1,0 +1,79 @@
+{
+  "simulation": {
+    "timing": {
+      "physics_hz": 600.0,
+      "render_fps": 30.0,
+      "realtime": false
+    }
+  },
+  "control": {
+    "source": "ardusub_sitl",
+    "ardusub_sitl": {
+      "bind_address": "127.0.0.1",
+      "json_port": 9002,
+      "packet_timeout_s": 1.0,
+      "mavlink_sensor_endpoint": "udpin:127.0.0.1:14552",
+      "mavlink_system_id": 43,
+      "mavlink_component_id": 197,
+      "battery_voltage_v": 16.0,
+      "battery_current_a": 0.0,
+      "water_surface_z": 0.0,
+      "gravity_m_s2": 9.80665,
+      "home": {
+        "latitude_deg": 63.440791,
+        "longitude_deg": 10.348857,
+        "altitude_m": 0.0,
+        "heading_deg": 0.0
+      },
+      "thrust_curve_csv": "config/thrusters/T200_PWM_N.csv",
+      "pwm_min": 1100,
+      "pwm_neutral": 1500,
+      "pwm_max": 1900,
+      "mvm_thruster_servo_channels": [2, 1, 4, 3, 6, 5, 8, 7],
+      "mvm_thruster_directions": [-1, -1, 1, 1, -1, -1, -1, -1]
+    }
+  },
+  "robot": {
+    "pose_topic": "/auv/pose_actual",
+    "velocity_topic": "/auv/velocity_actual",
+    "acceleration_topic": "/auv/acceleration_actual",
+    "ros2_frame_id": "auv_base_link",
+    "world_frame_id": "World"
+  },
+  "sensors": {
+    "uw_camera": {
+      "ros2_topic": "/auv/camera/image_raw",
+      "ros2_processed_topic": "/auv/camera/processed",
+      "ros2_camera_info_topic": "/auv/camera/camera_info",
+      "ros2_frame_id": "auv/uw_camera_link"
+    },
+    "imaging_sonar": {
+      "ros2_topic": "/auv/imaging_sonar",
+      "ros2_frame_id": "auv/imaging_sonar_link"
+    },
+    "rtx_lidar": {
+      "ros2_topic": "/auv/sonar_point_cloud",
+      "ros2_frame_id": "auv/three_d_sonar_link"
+    },
+    "dvl": {
+      "ros2_topic": "/auv/dvl",
+      "ros2_altitude_topic": "/auv/dvl/altitude",
+      "ros2_frame_id": "auv/dvl_link"
+    },
+    "imu": {
+      "ros2_topic": "/auv/imu/data_raw",
+      "ros2_frame_id": "auv/imu_link"
+    },
+    "magnetometer": {
+      "ros2_topic": "/auv/imu/magnetic_field",
+      "ros2_frame_id": "auv/imu_link"
+    },
+    "barometer": {
+      "ros2_topic": "/auv/pressure/scaled2",
+      "ros2_frame_id": "auv/barometer_link"
+    }
+  },
+  "mvm": {
+    "forces_topic": "/auv/forces_desired"
+  }
+}
